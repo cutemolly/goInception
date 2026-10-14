@@ -3702,6 +3702,15 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string, mergeOnl
 
 // checkDDLInstantMySQL57
 func checkDDLInstantMySQL57(node *ast.AlterTableStmt) (canInstant bool) {
+	// 当用户指定了 ALGORITHM=INSTANT 时,忽略检查并关闭osc.
+	// ALGORITHM 是独立的 spec 且通常位于语句末尾, 必须先扫描,
+	// 否则会被前面 spec 的 default 分支提前 return 掉.
+	for _, alter := range node.Specs {
+		if alter.Algorithm == ast.AlgorithmTypeInstant {
+			return true
+		}
+	}
+
 	// 如果mysql版本小于8.0,只有VIRTUAL column支持Only Modifies Metadata
 	for _, alter := range node.Specs {
 		switch alter.Tp {
@@ -3742,13 +3751,30 @@ func checkDDLInstantMySQL57(node *ast.AlterTableStmt) (canInstant bool) {
 
 // checkDDLInstantMySQL80
 func checkDDLInstantMySQL80(node *ast.AlterTableStmt, t *TableInfo, dbVersion int) (canInstant bool) {
-	canInstantSpecs := 0
+	// 当用户指定了 ALGORITHM=INSTANT 时,忽略检查并关闭osc.
+	// ALGORITHM 是独立的 spec 且通常位于语句末尾, 必须先扫描,
+	// 否则会被前面 spec 的 default 分支提前 return 掉.
 	for _, alter := range node.Specs {
-		// 当用户指定了 ALGORITHM=INSTANT 时,忽略检查并关闭osc
 		if alter.Algorithm == ast.AlgorithmTypeInstant {
-			canInstant = true
-			return
+			return true
 		}
+	}
+
+	// ALGORITHM/LOCK 本身不参与 INSTANT 判定, 从待检 spec 中剔除
+	specs := make([]*ast.AlterTableSpec, 0, len(node.Specs))
+	for _, alter := range node.Specs {
+		if alter.Tp == ast.AlterTableLock || alter.Tp == ast.AlterTableAlgorithm {
+			continue
+		}
+		specs = append(specs, alter)
+	}
+
+	canInstantSpecs := 0
+	for _, alter := range specs {
+		// instant 记录当前 spec 是否满足 INSTANT 条件.
+		// 不能再用 canInstantSpecs++ 计数: ADD COLUMN 带定位时会被加两次,
+		// 与 len(node.Specs) 比较必然不等(8.0.29+ 的 AFTER/FIRST 场景).
+		instant := false
 
 		switch alter.Tp {
 		case ast.AlterTableAddColumns:
@@ -3780,12 +3806,11 @@ func checkDDLInstantMySQL80(node *ast.AlterTableStmt, t *TableInfo, dbVersion in
 			if alter.Position.Tp != ast.ColumnPositionNone {
 				if dbVersion < 80029 {
 					return
-				} else {
-					canInstantSpecs++
 				}
+				instant = true
 			}
 			if virtualColumns == newColumns {
-				canInstantSpecs++
+				instant = true
 			} else {
 				return
 			}
@@ -3794,23 +3819,28 @@ func checkDDLInstantMySQL80(node *ast.AlterTableStmt, t *TableInfo, dbVersion in
 			for _, field := range t.Fields {
 				if strings.EqualFold(field.Field, alter.OldColumnName.Name.O) && !field.IsDeleted {
 					if strings.Contains(field.Extra, "VIRTUAL") {
-						canInstantSpecs++
+						instant = true
 					}
 					break
 				}
 			}
 
 		case ast.AlterTableRenameTable:
-			canInstantSpecs++
+			instant = true
 
 		case ast.AlterTableAlterColumn:
-			canInstantSpecs++
+			instant = true
 
 		default:
 			return
 		}
+
+		if !instant {
+			return
+		}
+		canInstantSpecs++
 	}
-	if canInstantSpecs == len(node.Specs) {
+	if len(specs) > 0 && canInstantSpecs == len(specs) {
 		canInstant = true
 	}
 	return canInstant

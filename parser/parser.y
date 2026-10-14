@@ -2810,7 +2810,8 @@ AlgorithmClause:
 	}
 |	"ALGORITHM" EqOpt identifier
 	{
-		yylex.AppendError(ErrUnknownAlterAlgorithm.GenWithStackByArgs($1))
+		// 上游此处误用 $1(关键字 "ALGORITHM"), 应报出实际的算法名
+		yylex.AppendError(ErrUnknownAlterAlgorithm.GenWithStackByArgs($3))
 		return 1
 	}
 
