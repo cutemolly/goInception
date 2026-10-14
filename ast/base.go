@@ -24,8 +24,11 @@ import (
 // Node implementations should embed it in.
 type node struct {
 	utf8Text string
-	enc      charset.Encoding
-	once     *sync.Once
+	// enc 指向 charset.Encoding, 其 encodingBase.self 指回实现自身,
+	// json2 反射序列化(goInception 的 --enable-query-print)会无限递归栈溢出;
+	// once 同理无序列化意义, 一并跳过。
+	enc  charset.Encoding `json:"-"`
+	once *sync.Once       `json:"-"`
 
 	text   string
 	offset int
