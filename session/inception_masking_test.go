@@ -76,6 +76,32 @@ func (s *testSessionMaskingSuite) TestInsert(c *C) {
 	}
 }
 
+func (s *testSessionMaskingSuite) TestSetOprBraces(c *C) {
+
+	s.mustRunExec(c, `drop table if exists t1,t2;
+	create table t1(id int primary key,c1 int);
+	create table t2(id int primary key,c1 int);
+	insert into t1 values(1,1),(2,2);`)
+
+	// 括号包裹的操作数会被解析成 *ast.SetOprSelectList 嵌在 Selects 里,
+	// 早期直接断言 *ast.SelectStmt 会 panic 并中断连接.
+	cases := []string{
+		`select id,c1 from t1 union (select id,c1 from t2)`,
+		`(select id,c1 from t1) union (select id,c1 from t2)`,
+		`(select id,c1 from t1 union select id,c1 from t2) union select 1,1`,
+		`(select id,c1 from t1) except (select id,c1 from t2)`,
+		`(select id,c1 from t1) intersect (select id,c1 from t2)`,
+	}
+	for _, sql := range cases {
+		res := s.makeSQL(sql)
+		row := res.Rows()[int(s.tk.Se.AffectedRows())-1]
+		c.Assert(row[2], Equals, "0", Commentf("%s: %v", sql, row))
+		// 两侧的表都要被脱敏字段覆盖, 漏掉括号操作数时 query_tree 会是空的
+		c.Assert(row[3], Matches, `.*"table":"t1".*`, Commentf("%s: %v", sql, row))
+		c.Assert(row[3], Matches, `.*"table":"t2".*`, Commentf("%s: %v", sql, row))
+	}
+}
+
 func (s *testSessionMaskingSuite) TestQuery(c *C) {
 
 	s.mustRunExec(c, `drop table if exists t1,t2;

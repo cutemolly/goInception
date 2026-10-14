@@ -20,6 +20,34 @@ const (
 	UnspecifiedSize = math.MaxUint64
 )
 
+// SetOprSelects 按出现顺序展平 set 操作(UNION/EXCEPT/INTERSECT)的操作数.
+//
+// 上游解析器把 SetOprSelectList.Selects 声明为 []Node: 只有括号包裹的操作数
+// 才会被包装成 *SetOprSelectList 再嵌一层, 例如
+//
+//	SELECT 1 UNION SELECT 2                  -> [SelectStmt, SelectStmt]
+//	(SELECT 1) UNION (SELECT 2)              -> [SetOprSelectList, SetOprSelectList]
+//	SELECT 1 UNION (SELECT 2 UNION SELECT 3) -> [SelectStmt, SetOprSelectList]
+//
+// 旧解析器是强类型 []*SelectStmt, 括号只体现在 SelectStmt.IsInBraces 上.
+// 因此遍历 Selects 时直接断言 *SelectStmt 会静默丢掉整个括号操作数(审核漏检),
+// 无保护的断言则会 panic, 一律改用本函数.
+func SetOprSelects(list *SetOprSelectList) []*SelectStmt {
+	if list == nil {
+		return nil
+	}
+	selects := make([]*SelectStmt, 0, len(list.Selects))
+	for _, sel := range list.Selects {
+		switch x := sel.(type) {
+		case *SelectStmt:
+			selects = append(selects, x)
+		case *SetOprSelectList:
+			selects = append(selects, SetOprSelects(x)...)
+		}
+	}
+	return selects
+}
+
 // IsReadOnly checks whether the input ast is readOnly.
 func IsReadOnly(node Node) bool {
 	switch st := node.(type) {

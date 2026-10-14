@@ -107,6 +107,36 @@ func TestUnionReadOnly(t *testing.T) {
 	require.False(t, IsReadOnly(setOprStmt))
 }
 
+func TestSetOprSelects(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want int
+	}{
+		// 括号包裹的操作数会被包装成 *SetOprSelectList, 展平后仍应拿到全部操作数
+		{"select 1 union select 2", 2},
+		{"select 1 union all select 2", 2},
+		{"(select 1) union (select 2)", 2},
+		{"select 1 union (select 2)", 2},
+		{"(select 1) union select 2", 2},
+		{"(select 1) union (select 2) union (select 3)", 3},
+		{"(select 1 union select 2) union (select 3)", 3},
+		{"select 1 union (select 2 union select 3)", 3},
+		{"(select 1) except (select 2)", 2},
+		{"(select 1) intersect (select 2)", 2},
+		{"(select 1) except (select 2) intersect (select 3)", 3},
+	}
+	for _, ca := range cases {
+		stmt, err := parser.New().ParseOneStmt(ca.sql, "", "")
+		require.NoError(t, err, ca.sql)
+		setOpr, ok := stmt.(*SetOprStmt)
+		require.True(t, ok, ca.sql)
+		require.Len(t, SetOprSelects(setOpr.SelectList), ca.want, ca.sql)
+	}
+
+	// nil 安全
+	require.Empty(t, SetOprSelects(nil))
+}
+
 // CleanNodeText set the text of node and all child node empty.
 // For test only.
 func CleanNodeText(node Node) {

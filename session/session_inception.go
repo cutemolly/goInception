@@ -597,12 +597,7 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 		s.checkUpdate(node, currentSql)
 
 	case *ast.SetOprStmt:
-		for _, sel := range node.SelectList.Selects {
-			// The upstream parser types the operands as ast.Node.
-			selectStmt, ok := sel.(*ast.SelectStmt)
-			if !ok {
-				continue
-			}
+		for _, selectStmt := range ast.SetOprSelects(node.SelectList) {
 			if selectStmt.Fields != nil {
 				for _, field := range selectStmt.Fields.Fields {
 					if field.WildCard != nil {
@@ -5662,14 +5657,9 @@ func (s *session) checkCreateView(node *ast.CreateViewStmt, sql string) {
 
 	switch selectNode := node.Select.(type) {
 	case *ast.SetOprStmt:
-		for _, sel := range selectNode.SelectList.Selects {
+		for _, selectStmt := range ast.SetOprSelects(selectNode.SelectList) {
 			// 是否有星号列
 			hasWildCard := false
-			// The upstream parser types the operands as ast.Node.
-			selectStmt, ok := sel.(*ast.SelectStmt)
-			if !ok {
-				continue
-			}
 			if selectStmt.Fields != nil {
 				for _, field := range selectStmt.Fields.Fields {
 					if field.WildCard != nil {
@@ -6038,9 +6028,7 @@ func (s *session) checkInsert(node *ast.InsertStmt, sql string) {
 		sel, ok := node.Select.(*ast.SelectStmt)
 		if !ok {
 			if u, ok := node.Select.(*ast.SetOprStmt); ok {
-				if first, ok2 := setOprFirstSelect(u); ok2 {
-					sel, _ = first.(*ast.SelectStmt)
-				}
+				sel, _ = setOprFirstSelect(u)
 			}
 		}
 
@@ -8505,10 +8493,10 @@ func extractTableList(node ast.ResultSetNode, input []*ast.TableSource) []*ast.T
 			input = extractTableList(x.From.TableRefs, input)
 		}
 	case *ast.SetOprStmt:
-		for _, sel := range x.SelectList.Selects {
-			if resultSet, ok := sel.(ast.ResultSetNode); ok {
-				input = extractTableList(resultSet, input)
-			}
+		// 括号包裹的操作数是 *ast.SetOprSelectList, 它不是 ResultSetNode,
+		// 用 ResultSetNode 断言会把整个括号操作数涉及的表漏掉.
+		for _, sel := range ast.SetOprSelects(x.SelectList) {
+			input = extractTableList(sel, input)
 		}
 	default:
 		log.Infof("%T", x)
@@ -8704,29 +8692,24 @@ func (s *session) checkSelectItem(node ast.ResultSetNode,
 			defer s.popCTEScope()
 			s.checkCTEQuery(x.With)
 		}
-		stmt := x.SelectList
-		for _, sel := range stmt.Selects[:len(stmt.Selects)-1] {
-			// The upstream parser types the operands as ast.Node.
-			var limit *ast.Limit
-			var orderBy *ast.OrderByClause
-			switch v := sel.(type) {
-			case *ast.SelectStmt:
-				limit, orderBy = v.Limit, v.OrderBy
-			case *ast.SetOprStmt:
-				limit, orderBy = v.Limit, v.OrderBy
-			}
-			if limit != nil {
-				s.appendErrorNo(ErrWrongUsage, "UNION", "LIMIT")
-			}
-			if orderBy != nil {
-				s.appendErrorNo(ErrWrongUsage, "UNION", "ORDER BY")
+		// 括号包裹的操作数会被解析成 *ast.SetOprSelectList, 直接断言
+		// *ast.SelectStmt 会把整个括号操作数漏掉, 必须先展平.
+		selects := ast.SetOprSelects(x.SelectList)
+		if n := len(selects); n > 1 {
+			// 最后一个操作数上的 ORDER BY/LIMIT 属于整个 set 操作, 合法;
+			// 出现在前面的操作数上才是用法错误.
+			for _, sel := range selects[:n-1] {
+				if sel.Limit != nil {
+					s.appendErrorNo(ErrWrongUsage, "UNION", "LIMIT")
+				}
+				if sel.OrderBy != nil {
+					s.appendErrorNo(ErrWrongUsage, "UNION", "ORDER BY")
+				}
 			}
 		}
 
-		for _, sel := range stmt.Selects {
-			if selectStmt, ok := sel.(*ast.SelectStmt); ok {
-				s.checkSubSelectItem(selectStmt, outerTables)
-			}
+		for _, selectStmt := range selects {
+			s.checkSubSelectItem(selectStmt, outerTables)
 		}
 
 	case *ast.SelectStmt:
@@ -9297,13 +9280,16 @@ func exprDatum(expr ast.ExprNode) *types.Datum {
 	return &zeroDatum
 }
 
-// setOprFirstSelect returns the first operand of a set operation as a
-// ResultSetNode. The upstream parser types the operands as ast.Node, which
-// does not carry the unexported resultSet marker method.
-func setOprFirstSelect(u *ast.SetOprStmt) (ast.ResultSetNode, bool) {
-	if u == nil || u.SelectList == nil || len(u.SelectList.Selects) == 0 {
+// setOprFirstSelect 返回 set 操作的第一个操作数.
+// 括号包裹的操作数会被解析成 *ast.SetOprSelectList 而非 ResultSetNode,
+// 需递归下探到最内层的 SelectStmt.
+func setOprFirstSelect(u *ast.SetOprStmt) (*ast.SelectStmt, bool) {
+	if u == nil {
 		return nil, false
 	}
-	rs, ok := u.SelectList.Selects[0].(ast.ResultSetNode)
-	return rs, ok
+	selects := ast.SetOprSelects(u.SelectList)
+	if len(selects) == 0 {
+		return nil, false
+	}
+	return selects[0], true
 }

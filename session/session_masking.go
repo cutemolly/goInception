@@ -85,8 +85,10 @@ func (s *masking) checkSelectItem(node ast.ResultSetNode, level int) (
 
 	switch x := node.(type) {
 	case *ast.SetOprStmt:
-		for _, sel := range x.SelectList.Selects {
-			tmpTables, tmpFields := s.checkSubSelectItem(sel.(*ast.SelectStmt), level)
+		// 括号包裹的操作数会被解析成 *ast.SetOprSelectList,
+		// 不能直接断言 *ast.SelectStmt(会 panic), 用 SetOprSelects 展平.
+		for _, sel := range ast.SetOprSelects(x.SelectList) {
+			tmpTables, tmpFields := s.checkSubSelectItem(sel, level)
 			if tmpTables != nil {
 				tables = append(tables, tmpTables...)
 			}

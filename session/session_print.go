@@ -207,29 +207,21 @@ func (s *session) printSelectItem(node ast.ResultSetNode) bool {
 
 	switch x := node.(type) {
 	case *ast.SetOprStmt:
-		stmt := x.SelectList
-		for _, sel := range stmt.Selects[:len(stmt.Selects)-1] {
-			// The upstream parser types the operands as ast.Node.
-			var limit *ast.Limit
-			var orderBy *ast.OrderByClause
-			switch v := sel.(type) {
-			case *ast.SelectStmt:
-				limit, orderBy = v.Limit, v.OrderBy
-			case *ast.SetOprStmt:
-				limit, orderBy = v.Limit, v.OrderBy
-			}
-			if limit != nil {
-				s.appendErrorNo(ErrWrongUsage, "UNION", "LIMIT")
-			}
-			if orderBy != nil {
-				s.appendErrorNo(ErrWrongUsage, "UNION", "ORDER BY")
+		// 括号包裹的操作数会被解析成 *ast.SetOprSelectList, 需展平后再遍历.
+		selects := ast.SetOprSelects(x.SelectList)
+		if n := len(selects); n > 1 {
+			for _, sel := range selects[:n-1] {
+				if sel.Limit != nil {
+					s.appendErrorNo(ErrWrongUsage, "UNION", "LIMIT")
+				}
+				if sel.OrderBy != nil {
+					s.appendErrorNo(ErrWrongUsage, "UNION", "ORDER BY")
+				}
 			}
 		}
 
-		for _, sel := range stmt.Selects {
-			if selectStmt, ok := sel.(*ast.SelectStmt); ok {
-				s.printSubSelectItem(selectStmt)
-			}
+		for _, selectStmt := range selects {
+			s.printSubSelectItem(selectStmt)
 		}
 
 	case *ast.SelectStmt:
