@@ -8698,6 +8698,12 @@ func (s *session) checkSelectItem(node ast.ResultSetNode,
 
 	switch x := node.(type) {
 	case *ast.SetOprStmt:
+		// WITH 也可以挂在 UNION 整体上
+		if x.With != nil {
+			s.pushCTEScope(x.With)
+			defer s.popCTEScope()
+			s.checkCTEQuery(x.With)
+		}
 		stmt := x.SelectList
 		for _, sel := range stmt.Selects[:len(stmt.Selects)-1] {
 			// The upstream parser types the operands as ast.Node.
@@ -8742,6 +8748,15 @@ func (s *session) checkSelectItem(node ast.ResultSetNode,
 	case *ast.TableSource:
 		switch tblSource := x.Source.(type) {
 		case *ast.TableName:
+			// CTE 名优先于同名真实表, 不能去远端查表
+			if cte := s.lookupCTE(tblSource.Name.O); cte != nil {
+				if x.AsName.L != "" {
+					t := cte.copy()
+					t.AsName = x.AsName.O
+					return []*TableInfo{t}
+				}
+				return []*TableInfo{cte}
+			}
 			t := s.getTableFromCache(tblSource.Schema.O, tblSource.Name.O, true)
 			if t != nil {
 				if x.AsName.L != "" {
@@ -8795,8 +8810,79 @@ func (s *session) checkSelectItem(node ast.ResultSetNode,
 	return nil
 }
 
+// cteKey 统一 CTE 名字的大小写, 与表名缓存保持一致.
+func (s *session) cteKey(name string) string {
+	if s.IgnoreCase() {
+		return strings.ToLower(name)
+	}
+	return name
+}
+
+// pushCTEScope 注册 WITH 子句定义的 CTE, 使其在后续表名解析中优先于同名真实表.
+// CTE 之间可以互相引用, 因此先把名字全部登记进作用域, 再回填列信息.
+func (s *session) pushCTEScope(with *ast.WithClause) {
+	scope := make(map[string]*TableInfo, len(with.CTEs))
+	s.cteScopes = append(s.cteScopes, scope)
+
+	for _, cte := range with.CTEs {
+		t := &TableInfo{Name: cte.Name.O}
+		scope[s.cteKey(cte.Name.O)] = t
+
+		// WITH cte(c1, c2) AS (...) 显式指定了列名
+		if len(cte.ColNameList) > 0 {
+			for _, c := range cte.ColNameList {
+				t.Fields = append(t.Fields, FieldInfo{Table: cte.Name.O, Field: c.O})
+			}
+			continue
+		}
+		if cte.Query != nil {
+			for _, col := range s.getSubSelectColumns(cte.Query.Query) {
+				t.Fields = append(t.Fields, FieldInfo{Table: cte.Name.O, Field: col})
+			}
+		}
+	}
+}
+
+func (s *session) popCTEScope() {
+	if n := len(s.cteScopes); n > 0 {
+		s.cteScopes = s.cteScopes[:n-1]
+	}
+}
+
+// lookupCTE 由内向外查找 CTE 定义, 未命中返回 nil.
+func (s *session) lookupCTE(name string) *TableInfo {
+	key := s.cteKey(name)
+	for i := len(s.cteScopes) - 1; i >= 0; i-- {
+		if t, ok := s.cteScopes[i][key]; ok {
+			return t
+		}
+	}
+	return nil
+}
+
+// checkCTEQuery 审核 CTE 自身的查询体, 否则 CTE 内部引用的表不会被检查.
+func (s *session) checkCTEQuery(with *ast.WithClause) {
+	for _, cte := range with.CTEs {
+		if cte.Query == nil {
+			continue
+		}
+		switch q := cte.Query.Query.(type) {
+		case *ast.SelectStmt:
+			s.checkSubSelectItem(q, nil)
+		case *ast.SetOprStmt:
+			s.checkSelectItem(q, nil, false)
+		}
+	}
+}
+
 func (s *session) checkSubSelectItem(node *ast.SelectStmt, outerTables []*TableInfo) []*TableInfo {
 	log.Debug("checkSubSelectItem")
+
+	if node.With != nil {
+		s.pushCTEScope(node.With)
+		defer s.popCTEScope()
+		s.checkCTEQuery(node.With)
+	}
 
 	var tableList []*ast.TableSource
 	if node.From != nil {
@@ -8813,6 +8899,17 @@ func (s *session) checkSubSelectItem(node *ast.SelectStmt, outerTables []*TableI
 		switch x := tblSource.Source.(type) {
 		case *ast.TableName:
 			tblName := x
+			// CTE 名优先于同名真实表, 不能去远端查表
+			if cte := s.lookupCTE(tblName.Name.O); cte != nil {
+				if tblSource.AsName.L != "" {
+					t := cte.copy()
+					t.AsName = tblSource.AsName.O
+					tableInfoList = append(tableInfoList, t)
+				} else {
+					tableInfoList = append(tableInfoList, cte)
+				}
+				continue
+			}
 			t := s.getTableFromCache(tblName.Schema.O, tblName.Name.O, true)
 			if t != nil {
 				// if tblSource.AsName.L != "" {

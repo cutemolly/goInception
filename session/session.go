@@ -190,6 +190,10 @@ type session struct {
 	tableCacheList map[string]*TableInfo
 	dbCacheList    map[string]*DBInfo
 
+	// WITH 子句定义的 CTE 作用域栈(由内向外查找).
+	// CTE 名优先于同名真实表, 不能拿去远端查表, 否则会误报"表不存在".
+	cteScopes []map[string]*TableInfo
+
 	// 备份库
 	backupDBCacheList map[string]bool
 	// 备份库中的备份表
