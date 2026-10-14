@@ -3826,6 +3826,11 @@ func checkDDLInstantMySQL80(node *ast.AlterTableStmt, t *TableInfo, dbVersion in
 		case ast.AlterTableAlterColumn:
 			instant = true
 
+		case ast.AlterTableIndexInvisible:
+			// ALTER INDEX ... VISIBLE/INVISIBLE 只改数据字典, 不重建索引或表,
+			// 交给 pt-osc/gh-ost 会白白整表拷贝一次. 该语法为 MySQL 8.0 专属.
+			instant = true
+
 		default:
 			return
 		}

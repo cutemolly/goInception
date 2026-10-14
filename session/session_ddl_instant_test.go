@@ -67,6 +67,11 @@ func Test_checkDDLInstantMatrix(t *testing.T) {
 		// ---- ALTER COLUMN (仅改默认值) ----
 		{"alter table t1 alter column c1 set default 1;", false, true, "ALTER COLUMN SET DEFAULT"},
 
+		// ---- ALTER INDEX (可见性切换, 8.0 只改元数据) ----
+		{"alter table t1 alter index idx_c1 invisible;", false, true, "ALTER INDEX INVISIBLE"},
+		{"alter table t1 alter index idx_c1 visible;", false, true, "ALTER INDEX VISIBLE"},
+		{"alter table t1 add column c9 int, alter index idx_c1 invisible;", false, true, "ADD COLUMN + ALTER INDEX"},
+
 		// ---- 不支持 INSTANT ----
 		{"alter table t1 modify column c1 bigint;", false, false, "MODIFY COLUMN"},
 		{"alter table t1 change column c1 c9 bigint;", false, false, "CHANGE COLUMN"},
