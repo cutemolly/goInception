@@ -882,8 +882,15 @@ func (s *testIntegrationSuite) TestStringBuiltin(c *C) {
 	result.Check(testkit.Rows("'121' '0' '中文' <nil>"))
 
 	// for convert
-	result = tk.MustQuery(`select convert("123" using "866"), convert("123" using "binary"), convert("中文" using "binary"), convert("中文" using "utf8"), convert("中文" using "utf8mb4"), convert(cast("中文" as binary) using "utf8");`)
-	result.Check(testkit.Rows("123 123 中文 中文 中文 中文"))
+	result = tk.MustQuery(`select convert("123" using "binary"), convert("中文" using "binary"), convert("中文" using "utf8"), convert("中文" using "utf8mb4"), convert(cast("中文" as binary) using "utf8");`)
+	result.Check(testkit.Rows("123 中文 中文 中文 中文"))
+	// The upgraded parser validates charset names at parse time, so "866" (the
+	// x/text encoding alias, not a MySQL charset name) is rejected up front
+	// instead of being passed through to the evaluator.
+	_, convErr := tk.Exec(`select convert("123" using "866")`)
+	c.Assert(convErr, NotNil)
+	c.Assert(strings.Contains(convErr.Error(), "Unknown character set: '866'"), IsTrue,
+		Commentf("unexpected error: %v", convErr))
 
 	// for insert
 	result = tk.MustQuery(`select insert("中文", 1, 1, cast("aaa" as binary)), insert("ba", -1, 1, "aaa"), insert("ba", 1, 100, "aaa"), insert("ba", 100, 1, "aaa");`)
@@ -2235,11 +2242,12 @@ func (s *testIntegrationSuite) TestBuiltin(c *C) {
 	result.Check(testkit.Rows("ad\x01\x00Y"))
 	result = tk.MustQuery("select char(97, null, 100, 256, 89 using ascii)")
 	result.Check(testkit.Rows("ad\x01\x00Y"))
-	charRecordSet, err := tk.Exec("select char(97, null, 100, 256, 89 using tidb)")
-	c.Assert(err, IsNil)
-	c.Assert(charRecordSet, NotNil)
-	_, err = session.GetRows4Test(ctx, tk.Se, charRecordSet)
-	c.Assert(err.Error(), Equals, "unknown encoding: tidb")
+	// The upgraded parser validates charset names at parse time, so an unknown
+	// charset now fails in Exec rather than in the evaluator.
+	_, err = tk.Exec("select char(97, null, 100, 256, 89 using tidb)")
+	c.Assert(err, NotNil)
+	c.Assert(strings.Contains(err.Error(), "Unknown character set: 'tidb'"), IsTrue,
+		Commentf("unexpected error: %v", err))
 
 	// issue 3884
 	tk.MustExec("drop table if exists t")

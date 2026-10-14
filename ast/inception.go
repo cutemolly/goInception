@@ -15,46 +15,45 @@ package ast
 
 import (
 	. "github.com/hanchuanchuan/goInception/format"
-	"github.com/hanchuanchuan/goInception/util/auth"
 )
 
 var (
 	_ StmtNode = &InceptionStartStmt{}
 	_ StmtNode = &InceptionCommitStmt{}
-	_ StmtNode = &InceptionStmt{}
 	_ StmtNode = &InceptionSetStmt{}
 
 	_ StmtNode = &ShowOscStmt{}
 )
 
+// OscOptionType is the operation type of a show osc statement.
 type OscOptionType int
 
 const (
-	// 显示osc进程信息
+	// OscOptionNone shows osc process information.
 	OscOptionNone OscOptionType = iota
-	// kill进程
+	// OscOptionKill kills the osc process.
 	OscOptionKill
-	// 暂停进程(仅gh-ost支持)
+	// OscOptionPause pauses the osc process (gh-ost only).
 	OscOptionPause
-	// 恢复进程(仅gh-ost支持)
+	// OscOptionResume resumes the osc process (gh-ost only).
 	OscOptionResume
 )
 
 const (
-	// Show statement types.
+	// ShowLevels is the show statement type of `show levels`.
 	ShowLevels ShowStmtType = 1001
 )
 
-// ShowOscStmt pt-osc和gh-ost的语法解析
+// ShowOscStmt is the AST node of pt-osc and gh-ost related statements.
 type ShowOscStmt struct {
 	stmtNode
 
 	Sqlsha1 string
 
-	// Kill bool
 	Tp OscOptionType
 }
 
+// Restore implements Node interface.
 func (n *ShowOscStmt) Restore(ctx *RestoreCtx) error {
 	return nil
 }
@@ -69,13 +68,14 @@ func (n *ShowOscStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// InceptionSetStmt is the statement to set variables.
+// InceptionSetStmt is the statement to set inception variables.
 type InceptionSetStmt struct {
 	stmtNode
 	// Variables is the list of variable assignment.
 	Variables []*VariableAssignment
 }
 
+// Restore implements Node interface.
 func (n *InceptionSetStmt) Restore(ctx *RestoreCtx) error {
 	return nil
 }
@@ -97,81 +97,14 @@ func (n *InceptionSetStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// CommitStmt is a statement to commit the current transaction.
-// See https://dev.mysql.com/doc/refman/5.7/en/commit.html
-type InceptionStmt struct {
-	stmtNode
-
-	resultSetNode
-
-	Tp     ShowStmtType // Databases/Tables/Columns/....
-	DBName string
-	Table  *TableName  // Used for showing columns.
-	Column *ColumnName // Used for `desc table column`.
-	Flag   int         // Some flag parsed from sql, such as FULL.
-	Full   bool
-	User   *auth.UserIdentity // Used for show grants.
-
-	// GlobalScope is used by show variables
-	GlobalScope bool
-	Pattern     *PatternLikeExpr
-	Where       ExprNode
-}
-
-func (n *InceptionStmt) Restore(ctx *RestoreCtx) error {
-	return nil
-}
-
-// Accept implements Node Accept interface.
-func (n *InceptionStmt) Accept(v Visitor) (Node, bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-	n = newNode.(*InceptionStmt)
-	if n.Table != nil {
-		node, ok := n.Table.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Table = node.(*TableName)
-	}
-	if n.Column != nil {
-		node, ok := n.Column.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Column = node.(*ColumnName)
-	}
-	if n.Pattern != nil {
-		node, ok := n.Pattern.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Pattern = node.(*PatternLikeExpr)
-	}
-
-	switch n.Tp {
-	case ShowTriggers, ShowProcedureStatus, ShowProcessList, ShowEvents:
-		// We don't have any data to return for those types,
-		// but visiting Where may cause resolving error, so return here to avoid error.
-		return v.Leave(n)
-	}
-
-	if n.Where != nil {
-		node, ok := n.Where.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Where = node.(ExprNode)
-	}
-	return v.Leave(n)
-}
-
-// CommitStmt is a statement to commit the current transaction.
-// See https://dev.mysql.com/doc/refman/5.7/en/commit.html
+// InceptionStartStmt is a statement to start an inception session.
 type InceptionStartStmt struct {
 	stmtNode
+}
+
+// Restore implements Node interface.
+func (n *InceptionStartStmt) Restore(ctx *RestoreCtx) error {
+	return nil
 }
 
 // Accept implements Node Accept interface.
@@ -184,14 +117,14 @@ func (n *InceptionStartStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-func (n *InceptionStartStmt) Restore(ctx *RestoreCtx) error {
-	return nil
-}
-
-// CommitStmt is a statement to commit the current transaction.
-// See https://dev.mysql.com/doc/refman/5.7/en/commit.html
+// InceptionCommitStmt is a statement to commit the current inception session.
 type InceptionCommitStmt struct {
 	stmtNode
+}
+
+// Restore implements Node interface.
+func (n *InceptionCommitStmt) Restore(ctx *RestoreCtx) error {
+	return nil
 }
 
 // Accept implements Node Accept interface.
@@ -202,8 +135,4 @@ func (n *InceptionCommitStmt) Accept(v Visitor) (Node, bool) {
 	}
 	n = newNode.(*InceptionCommitStmt)
 	return v.Leave(n)
-}
-
-func (n *InceptionCommitStmt) Restore(ctx *RestoreCtx) error {
-	return nil
 }

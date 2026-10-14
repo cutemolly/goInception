@@ -26,6 +26,7 @@ import (
 	"github.com/hanchuanchuan/goInception/sessionctx"
 	"github.com/hanchuanchuan/goInception/sessionctx/variable"
 	"github.com/hanchuanchuan/goInception/types"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/util/chunk"
 	"github.com/hanchuanchuan/goInception/util/sqlexec"
 	"github.com/pingcap/errors"
@@ -39,7 +40,7 @@ var (
 )
 
 type paramMarkerSorter struct {
-	markers []*ast.ParamMarkerExpr
+	markers []*driver.ParamMarkerExpr
 }
 
 func (p *paramMarkerSorter) Len() int {
@@ -55,7 +56,7 @@ func (p *paramMarkerSorter) Swap(i, j int) {
 }
 
 type paramMarkerExtractor struct {
-	markers []*ast.ParamMarkerExpr
+	markers []*driver.ParamMarkerExpr
 }
 
 func (e *paramMarkerExtractor) Enter(in ast.Node) (ast.Node, bool) {
@@ -63,7 +64,7 @@ func (e *paramMarkerExtractor) Enter(in ast.Node) (ast.Node, bool) {
 }
 
 func (e *paramMarkerExtractor) Leave(in ast.Node) (ast.Node, bool) {
-	if x, ok := in.(*ast.ParamMarkerExpr); ok {
+	if x, ok := in.(*driver.ParamMarkerExpr); ok {
 		e.markers = append(e.markers, x)
 	}
 	return in, true
@@ -147,16 +148,22 @@ func (e *PrepareExec) Next(ctx context.Context, chk *chunk.Chunk) error {
 	for i := 0; i < e.ParamCount; i++ {
 		sorter.markers[i].Order = i
 	}
+	// ast.Prepared.Params holds the ast.ParamMarkerExpr interface while the
+	// extractor keeps the concrete driver type, so convert explicitly.
+	params := make([]ast.ParamMarkerExpr, len(sorter.markers))
+	for i, marker := range sorter.markers {
+		params[i] = marker
+	}
 	prepared := &ast.Prepared{
 		Stmt:          stmt,
-		Params:        sorter.markers,
+		Params:        params,
 		SchemaVersion: e.is.SchemaMetaVersion(),
 	}
 	prepared.UseCache = plannercore.PreparedPlanCacheEnabled() && (vars.LightningMode || plannercore.Cacheable(stmt))
 
 	// We try to build the real statement of preparedStmt.
 	for i := range prepared.Params {
-		prepared.Params[i].SetDatum(types.NewIntDatum(0))
+		prepared.Params[i].(*driver.ParamMarkerExpr).SetDatum(types.NewIntDatum(0))
 	}
 	var p plannercore.Plan
 	p, err = plannercore.BuildLogicalPlan(e.ctx, stmt, e.is)
@@ -246,7 +253,7 @@ func CompileExecutePreparedStmt(ctx sessionctx.Context, ID uint32, args ...inter
 	}
 	execStmt.UsingVars = make([]ast.ExprNode, len(args))
 	for i, val := range args {
-		execStmt.UsingVars[i] = ast.NewValueExpr(val)
+		execStmt.UsingVars[i] = ast.NewValueExpr(val, "", "")
 	}
 	is := GetInfoSchema(ctx)
 	execPlan, err := planner.Optimize(ctx, execStmt, is)

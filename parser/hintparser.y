@@ -25,11 +25,13 @@ import (
 %}
 
 %union {
+	offset  int
 	ident   string
 	number  uint64
 	hint    *ast.TableOptimizerHint
 	hints []*ast.TableOptimizerHint
 	table 	ast.HintTable
+	modelIdents []model.CIStr
 }
 
 %token	<number>
@@ -41,6 +43,7 @@ import (
 
 	/*yy:token "%c" */
 	hintIdentifier
+	hintInvalid    "a special token never used by parser, used by lexer to indicate error"
 
 	/*yy:token "@%c" */
 	hintSingleAtIdentifier "identifier with single leading at"
@@ -58,6 +61,8 @@ import (
 	hintBNL                 "BNL"
 	hintNoBNL               "NO_BNL"
 	hintHashJoin            "HASH_JOIN"
+	hintHashJoinBuild       "HASH_JOIN_BUILD"
+	hintHashJoinProbe       "HASH_JOIN_PROBE"
 	hintNoHashJoin          "NO_HASH_JOIN"
 	hintMerge               "MERGE"
 	hintNoMerge             "NO_MERGE"
@@ -80,28 +85,49 @@ import (
 	hintAggToCop              "AGG_TO_COP"
 	hintIgnorePlanCache       "IGNORE_PLAN_CACHE"
 	hintHashAgg               "HASH_AGG"
+	hintMpp1PhaseAgg          "MPP_1PHASE_AGG"
+	hintMpp2PhaseAgg          "MPP_2PHASE_AGG"
 	hintIgnoreIndex           "IGNORE_INDEX"
+	hintIndexJoin             "INDEX_JOIN"
+	hintNoIndexJoin           "NO_INDEX_JOIN"
 	hintInlHashJoin           "INL_HASH_JOIN"
+	hintIndexHashJoin         "INDEX_HASH_JOIN"
+	hintNoIndexHashJoin       "NO_INDEX_HASH_JOIN"
 	hintInlJoin               "INL_JOIN"
 	hintInlMergeJoin          "INL_MERGE_JOIN"
+	hintIndexMergeJoin        "INDEX_MERGE_JOIN"
+	hintNoIndexMergeJoin      "NO_INDEX_MERGE_JOIN"
 	hintMemoryQuota           "MEMORY_QUOTA"
 	hintNoSwapJoinInputs      "NO_SWAP_JOIN_INPUTS"
 	hintQueryType             "QUERY_TYPE"
 	hintReadConsistentReplica "READ_CONSISTENT_REPLICA"
 	hintReadFromStorage       "READ_FROM_STORAGE"
 	hintSMJoin                "MERGE_JOIN"
+	hintNoSMJoin              "NO_MERGE_JOIN"
+	hintBCJoin                "BROADCAST_JOIN"
+	hintShuffleJoin           "SHUFFLE_JOIN"
 	hintStreamAgg             "STREAM_AGG"
 	hintSwapJoinInputs        "SWAP_JOIN_INPUTS"
 	hintUseIndexMerge         "USE_INDEX_MERGE"
 	hintUseIndex              "USE_INDEX"
+	hintOrderIndex            "ORDER_INDEX"
+	hintNoOrderIndex          "NO_ORDER_INDEX"
 	hintUsePlanCache          "USE_PLAN_CACHE"
 	hintUseToja               "USE_TOJA"
 	hintTimeRange             "TIME_RANGE"
 	hintUseCascades           "USE_CASCADES"
+	hintNthPlan               "NTH_PLAN"
+	hintLimitToCop            "LIMIT_TO_COP"
+	hintForceIndex            "FORCE_INDEX"
+	hintStraightJoin          "STRAIGHT_JOIN"
+	hintLeading               "LEADING"
+	hintSemiJoinRewrite       "SEMI_JOIN_REWRITE"
+	hintNoDecorrelate         "NO_DECORRELATE"
 
 	/* Other keywords */
 	hintOLAP            "OLAP"
 	hintOLTP            "OLTP"
+	hintPartition       "PARTITION"
 	hintTiKV            "TIKV"
 	hintTiFlash         "TIFLASH"
 	hintFalse           "FALSE"
@@ -145,6 +171,7 @@ import (
 	HintIndexList           "table name with index list in optimizer hint"
 	IndexNameList           "index list in optimizer hint"
 	IndexNameListOpt        "optional index list in optimizer hint"
+	ViewNameList            "view name list in optimizer hint"
 	SubqueryStrategies      "subquery strategies"
 	SubqueryStrategiesOpt   "optional subquery strategies"
 	HintTrueOrFalse         "true or false in optimizer hint"
@@ -152,6 +179,11 @@ import (
 
 %type	<table>
 	HintTable "Table in optimizer hint"
+	ViewName  "View name in optimizer hint"
+
+%type	<modelIdents>
+	PartitionList    "partition name list in optimizer hint"
+	PartitionListOpt "optional partition name list in optimizer hint"
 
 
 %start	Start
@@ -234,21 +266,44 @@ TableOptimizerHintOpt:
 			HintData: $4,
 		}
 	}
+|	"NTH_PLAN" '(' QueryBlockOpt hintIntLit ')'
+	{
+		$$ = &ast.TableOptimizerHint{
+			HintName: model.NewCIStr($1),
+			QBName:   model.NewCIStr($3),
+			HintData: int64($4),
+		}
+	}
 |	"SET_VAR" '(' Identifier '=' Value ')'
 	{
-		parser.warnUnsupportedHint($1)
-		$$ = nil
+		$$ = &ast.TableOptimizerHint{
+			HintName: model.NewCIStr($1),
+			HintData: ast.HintSetVar{
+				VarName: $3,
+				Value:   $5,
+			},
+		}
 	}
 |	"RESOURCE_GROUP" '(' Identifier ')'
 	{
-		parser.warnUnsupportedHint($1)
-		$$ = nil
+		$$ = &ast.TableOptimizerHint{
+			HintName: model.NewCIStr($1),
+			HintData: $3,
+		}
 	}
 |	"QB_NAME" '(' Identifier ')'
 	{
 		$$ = &ast.TableOptimizerHint{
 			HintName: model.NewCIStr($1),
 			QBName:   model.NewCIStr($3),
+		}
+	}
+|	"QB_NAME" '(' Identifier ',' ViewNameList ')'
+	{
+		$$ = &ast.TableOptimizerHint{
+			HintName: model.NewCIStr($1),
+			QBName:   model.NewCIStr($3),
+			Tables:   $5.Tables,
 		}
 	}
 |	"MEMORY_QUOTA" '(' QueryBlockOpt hintIntLit UnitOfBytes ')'
@@ -343,6 +398,26 @@ CommaOpt:
 |	','
 	{}
 
+PartitionListOpt:
+	/* empty */
+	{
+		$$ = nil
+	}
+|	"PARTITION" '(' PartitionList ')'
+	{
+		$$ = $3
+	}
+
+PartitionList:
+	Identifier
+	{
+		$$ = []model.CIStr{model.NewCIStr($1)}
+	}
+|	PartitionList CommaOpt Identifier
+	{
+		$$ = append($1, model.NewCIStr($3))
+	}
+
 /**
  * HintTableListOpt:
  *
@@ -375,6 +450,39 @@ HintTableList:
 	}
 
 HintTable:
+	Identifier QueryBlockOpt PartitionListOpt
+	{
+		$$ = ast.HintTable{
+			TableName:     model.NewCIStr($1),
+			QBName:        model.NewCIStr($2),
+			PartitionList: $3,
+		}
+	}
+|	Identifier '.' Identifier QueryBlockOpt PartitionListOpt
+	{
+		$$ = ast.HintTable{
+			DBName:        model.NewCIStr($1),
+			TableName:     model.NewCIStr($3),
+			QBName:        model.NewCIStr($4),
+			PartitionList: $5,
+		}
+	}
+
+ViewNameList:
+	ViewNameList '.' ViewName
+	{
+		h := $1
+		h.Tables = append(h.Tables, $3)
+		$$ = h
+	}
+|	ViewName
+	{
+		$$ = &ast.TableOptimizerHint{
+			Tables: []ast.HintTable{$1},
+		}
+	}
+
+ViewName:
 	Identifier QueryBlockOpt
 	{
 		$$ = ast.HintTable{
@@ -382,12 +490,10 @@ HintTable:
 			QBName:    model.NewCIStr($2),
 		}
 	}
-|	Identifier '.' Identifier QueryBlockOpt
+|	QueryBlockOpt
 	{
 		$$ = ast.HintTable{
-			DBName:    model.NewCIStr($1),
-			TableName: model.NewCIStr($3),
-			QBName:    model.NewCIStr($4),
+			QBName: model.NewCIStr($1),
 		}
 	}
 
@@ -447,6 +553,22 @@ Value:
 	{
 		$$ = strconv.FormatUint($1, 10)
 	}
+|	'+' hintIntLit
+	{
+		$$ = strconv.FormatUint($2, 10)
+	}
+|	'-' hintIntLit
+	{
+		if $2 > 9223372036854775808 {
+			yylex.AppendError(yylex.Errorf("the Signed Value should be at the range of [-9223372036854775808, 9223372036854775807]."))
+			return 1
+		} else if $2 == 9223372036854775808 {
+			signed_one := int64(1)
+			$$ = strconv.FormatInt(signed_one<<63, 10)
+		} else {
+			$$ = strconv.FormatInt(-int64($2), 10)
+		}
+	}
 
 UnitOfBytes:
 	"MB"
@@ -479,18 +601,30 @@ UnsupportedTableLevelOptimizerHintName:
 |	"BNL"
 |	"NO_BNL"
 /* HASH_JOIN is supported by TiDB */
-|	"NO_HASH_JOIN"
-|	"MERGE"
 |	"NO_MERGE"
 
 SupportedTableLevelOptimizerHintName:
 	"MERGE_JOIN"
+|	"NO_MERGE_JOIN"
+|	"BROADCAST_JOIN"
+|	"SHUFFLE_JOIN"
 |	"INL_JOIN"
+|	"INDEX_JOIN"
+|	"NO_INDEX_JOIN"
+|	"MERGE"
 |	"INL_HASH_JOIN"
+|	"INDEX_HASH_JOIN"
+|	"NO_INDEX_HASH_JOIN"
 |	"SWAP_JOIN_INPUTS"
 |	"NO_SWAP_JOIN_INPUTS"
 |	"INL_MERGE_JOIN"
+|	"INDEX_MERGE_JOIN"
+|	"NO_INDEX_MERGE_JOIN"
 |	"HASH_JOIN"
+|	"NO_HASH_JOIN"
+|	"HASH_JOIN_BUILD"
+|	"HASH_JOIN_PROBE"
+|	"LEADING"
 
 UnsupportedIndexLevelOptimizerHintName:
 	"INDEX_MERGE"
@@ -506,6 +640,9 @@ SupportedIndexLevelOptimizerHintName:
 	"USE_INDEX"
 |	"IGNORE_INDEX"
 |	"USE_INDEX_MERGE"
+|	"FORCE_INDEX"
+|	"ORDER_INDEX"
+|	"NO_ORDER_INDEX"
 
 SubqueryOptimizerHintName:
 	"SEMIJOIN"
@@ -524,11 +661,17 @@ BooleanHintName:
 NullaryHintName:
 	"USE_PLAN_CACHE"
 |	"HASH_AGG"
+|	"MPP_1PHASE_AGG"
+|	"MPP_2PHASE_AGG"
 |	"STREAM_AGG"
 |	"AGG_TO_COP"
+|	"LIMIT_TO_COP"
 |	"NO_INDEX_MERGE"
 |	"READ_CONSISTENT_REPLICA"
 |	"IGNORE_PLAN_CACHE"
+|	"STRAIGHT_JOIN"
+|	"SEMI_JOIN_REWRITE"
+|	"NO_DECORRELATE"
 
 HintQueryType:
 	"OLAP"
@@ -550,6 +693,8 @@ Identifier:
 |	"BNL"
 |	"NO_BNL"
 |	"HASH_JOIN"
+|	"HASH_JOIN_BUILD"
+|	"HASH_JOIN_PROBE"
 |	"NO_HASH_JOIN"
 |	"MERGE"
 |	"NO_MERGE"
@@ -569,26 +714,46 @@ Identifier:
 |	"QB_NAME"
 /* TiDB hint names */
 |	"AGG_TO_COP"
+|	"LIMIT_TO_COP"
 |	"IGNORE_PLAN_CACHE"
 |	"HASH_AGG"
+|	"MPP_1PHASE_AGG"
+|	"MPP_2PHASE_AGG"
 |	"IGNORE_INDEX"
 |	"INL_HASH_JOIN"
+|	"INDEX_HASH_JOIN"
+|	"NO_INDEX_HASH_JOIN"
 |	"INL_JOIN"
+|	"INDEX_JOIN"
+|	"NO_INDEX_JOIN"
 |	"INL_MERGE_JOIN"
+|	"INDEX_MERGE_JOIN"
+|	"NO_INDEX_MERGE_JOIN"
 |	"MEMORY_QUOTA"
 |	"NO_SWAP_JOIN_INPUTS"
 |	"QUERY_TYPE"
 |	"READ_CONSISTENT_REPLICA"
 |	"READ_FROM_STORAGE"
 |	"MERGE_JOIN"
+|	"NO_MERGE_JOIN"
+|	"BROADCAST_JOIN"
+|	"SHUFFLE_JOIN"
 |	"STREAM_AGG"
 |	"SWAP_JOIN_INPUTS"
 |	"USE_INDEX_MERGE"
 |	"USE_INDEX"
+|	"ORDER_INDEX"
+|	"NO_ORDER_INDEX"
 |	"USE_PLAN_CACHE"
 |	"USE_TOJA"
 |	"TIME_RANGE"
 |	"USE_CASCADES"
+|	"NTH_PLAN"
+|	"FORCE_INDEX"
+|	"STRAIGHT_JOIN"
+|	"LEADING"
+|	"SEMI_JOIN_REWRITE"
+|	"NO_DECORRELATE"
 /* other keywords */
 |	"OLAP"
 |	"OLTP"

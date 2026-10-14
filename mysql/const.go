@@ -161,7 +161,16 @@ const (
 
 // Auth name information.
 const (
-	AuthName = "mysql_native_password"
+	AuthName                = "mysql_native_password"
+	AuthNativePassword      = "mysql_native_password" // #nosec G101
+	AuthCachingSha2Password = "caching_sha2_password" // #nosec G101
+	AuthTiDBSM3Password     = "tidb_sm3_password"     // #nosec G101
+	AuthMySQLClearPassword  = "mysql_clear_password"
+	AuthSocket              = "auth_socket"
+	AuthTiDBSessionToken    = "tidb_session_token"
+	AuthTiDBAuthToken       = "tidb_auth_token"
+	AuthLDAPSimple          = "authentication_ldap_simple"
+	AuthLDAPSASL            = "authentication_ldap_sasl"
 )
 
 // MySQL database and tables.
@@ -189,10 +198,11 @@ const (
 )
 
 // PrivilegeType  privilege
-type PrivilegeType uint32
+type PrivilegeType uint64
 
 const (
-	_ PrivilegeType = 1 << iota
+	// UsagePriv is a synonym for "no privileges"
+	UsagePriv PrivilegeType = 1 << iota
 	// CreatePriv is the privilege to create schema/table.
 	CreatePriv
 	// SelectPriv is the privilege to read from table.
@@ -233,8 +243,39 @@ const (
 	CreateRolePriv
 	// DropRolePriv is the privilege to drop a role.
 	DropRolePriv
+	// CreateTMPTablePriv is the privilege to create a temporary table.
+	CreateTMPTablePriv
+	// LockTablesPriv is the privilege to lock tables.
+	LockTablesPriv
+	// CreateRoutinePriv is the privilege to create a stored routine.
+	CreateRoutinePriv
+	// AlterRoutinePriv is the privilege to alter a stored routine.
+	AlterRoutinePriv
+	// EventPriv is the privilege to event.
+	EventPriv
+	// ShutdownPriv the privilege to shutdown a server.
+	ShutdownPriv
+	// ReloadPriv is the privilege to enable the use of the FLUSH statement.
+	ReloadPriv
+	// FilePriv is the privilege to enable the use of LOAD DATA and SELECT ... INTO OUTFILE.
+	FilePriv
+	// ConfigPriv is the privilege to enable the use SET CONFIG statements.
+	ConfigPriv
+	// CreateTablespacePriv is the privilege to create tablespace.
+	CreateTablespacePriv
+	// ReplicationClientPriv is used in MySQL replication
+	ReplicationClientPriv
+	// ReplicationSlavePriv is used in MySQL replication
+	ReplicationSlavePriv
 	// AllPriv is the privilege for all actions.
 	AllPriv
+	/*
+	 *  Please add the new priv before AllPriv to keep the values consistent across versions.
+	 */
+
+	// ExtendedPriv is used to successful parse privileges not included above.
+	// these are dynamic privileges in MySQL 8.0 and other extended privileges like LOAD FROM S3 in Aurora.
+	ExtendedPriv
 )
 
 // AllPrivMask is the mask for PrivilegeType with all bits set to 1.
@@ -263,6 +304,8 @@ const (
 	MaxBitDisplayWidth       = 64
 	MaxFloatPrecisionLength  = 24
 	MaxDoublePrecisionLength = 53
+	// DefaultDecimal defines the default decimal value when the value out of range.
+	DefaultDecimal = "99999999999999999999999999999999999999999999999999999999999999999"
 )
 
 // MySQL max type field length.
@@ -274,8 +317,14 @@ const (
 // MaxTypeSetMembers is the number of set members.
 const MaxTypeSetMembers = 64
 
-// PWDHashLen is the length of password's hash.
-const PWDHashLen = 40
+// PWDHashLen is the length of mysql_native_password's hash.
+const PWDHashLen = 40 // excluding the '*'
+
+// SHAPWDHashLen is the length of sha256_password's hash.
+const SHAPWDHashLen = 70
+
+// SM3PWDHashLen is the length of tidb_sm3_password's hash.
+const SM3PWDHashLen = 70
 
 // Priv2UserCol is the privilege to mysql.user table column name.
 var Priv2UserCol = map[PrivilegeType]string{
@@ -358,22 +407,40 @@ var AllGlobalPrivs = []PrivilegeType{SelectPriv, InsertPriv, UpdatePriv, DeleteP
 
 // Priv2Str is the map for privilege to string.
 var Priv2Str = map[PrivilegeType]string{
-	CreatePriv:     "Create",
-	SelectPriv:     "Select",
-	InsertPriv:     "Insert",
-	UpdatePriv:     "Update",
-	DeletePriv:     "Delete",
-	ShowDBPriv:     "Show Databases",
-	SuperPriv:      "Super",
-	CreateUserPriv: "Create User",
-	TriggerPriv:    "Trigger",
-	DropPriv:       "Drop",
-	ProcessPriv:    "Process",
-	GrantPriv:      "Grant Option",
-	ReferencesPriv: "References",
-	AlterPriv:      "Alter",
-	ExecutePriv:    "Execute",
-	IndexPriv:      "Index",
+	CreatePriv:            "Create",
+	SelectPriv:            "Select",
+	InsertPriv:            "Insert",
+	UpdatePriv:            "Update",
+	DeletePriv:            "Delete",
+	ShowDBPriv:            "Show Databases",
+	SuperPriv:             "Super",
+	CreateUserPriv:        "Create User",
+	CreateTablespacePriv:  "Create Tablespace",
+	TriggerPriv:           "Trigger",
+	DropPriv:              "Drop",
+	ProcessPriv:           "Process",
+	GrantPriv:             "Grant Option",
+	ReferencesPriv:        "References",
+	AlterPriv:             "Alter",
+	ExecutePriv:           "Execute",
+	IndexPriv:             "Index",
+	CreateViewPriv:        "Create View",
+	ShowViewPriv:          "Show View",
+	CreateRolePriv:        "Create Role",
+	DropRolePriv:          "Drop Role",
+	CreateTMPTablePriv:    "CREATE TEMPORARY TABLES",
+	LockTablesPriv:        "LOCK TABLES",
+	CreateRoutinePriv:     "CREATE ROUTINE",
+	AlterRoutinePriv:      "ALTER ROUTINE",
+	EventPriv:             "EVENT",
+	ShutdownPriv:          "SHUTDOWN",
+	ReloadPriv:            "RELOAD",
+	FilePriv:              "FILE",
+	ConfigPriv:            "CONFIG",
+	UsagePriv:             "USAGE",
+	ReplicationClientPriv: "REPLICATION CLIENT",
+	ReplicationSlavePriv:  "REPLICATION SLAVE",
+	AllPriv:               AllPrivilegeLiteral,
 }
 
 // Priv2SetStr is the map for privilege to string.

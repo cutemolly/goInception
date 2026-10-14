@@ -16,16 +16,14 @@ package ast
 import (
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
-	"strconv"
 	"strings"
 
-	. "github.com/hanchuanchuan/goInception/format"
-	"github.com/hanchuanchuan/goInception/model"
-	"github.com/hanchuanchuan/goInception/mysql"
-	"github.com/hanchuanchuan/goInception/parser/opcode"
-	"github.com/hanchuanchuan/goInception/types"
 	"github.com/pingcap/errors"
+	"github.com/hanchuanchuan/goInception/format"
+	"github.com/hanchuanchuan/goInception/model"
+	"github.com/hanchuanchuan/goInception/parser/opcode"
 )
 
 var (
@@ -33,152 +31,45 @@ var (
 	_ ExprNode = &BinaryOperationExpr{}
 	_ ExprNode = &CaseExpr{}
 	_ ExprNode = &ColumnNameExpr{}
+	_ ExprNode = &TableNameExpr{}
 	_ ExprNode = &CompareSubqueryExpr{}
 	_ ExprNode = &DefaultExpr{}
 	_ ExprNode = &ExistsSubqueryExpr{}
 	_ ExprNode = &IsNullExpr{}
 	_ ExprNode = &IsTruthExpr{}
-	_ ExprNode = &ParamMarkerExpr{}
 	_ ExprNode = &ParenthesesExpr{}
 	_ ExprNode = &PatternInExpr{}
-	_ ExprNode = &PatternLikeExpr{}
+	_ ExprNode = &PatternLikeOrIlikeExpr{}
 	_ ExprNode = &PatternRegexpExpr{}
 	_ ExprNode = &PositionExpr{}
 	_ ExprNode = &RowExpr{}
 	_ ExprNode = &SubqueryExpr{}
 	_ ExprNode = &UnaryOperationExpr{}
-	_ ExprNode = &ValueExpr{}
 	_ ExprNode = &ValuesExpr{}
 	_ ExprNode = &VariableExpr{}
+	_ ExprNode = &MatchAgainst{}
+	_ ExprNode = &SetCollationExpr{}
 
 	_ Node = &ColumnName{}
 	_ Node = &WhenClause{}
 )
 
-// ValueExpr is the simple value expression.
-type ValueExpr struct {
-	exprNode
-	projectionOffset int
-}
-
-// Format the ExprNode into a Writer.
-func (n *ValueExpr) Format(w io.Writer) {
-	var s string
-	switch n.Kind() {
-	case types.KindNull:
-		s = "NULL"
-	case types.KindInt64:
-		if n.Type.Flag&mysql.IsBooleanFlag != 0 {
-			if n.GetInt64() > 0 {
-				s = "TRUE"
-			} else {
-				s = "FALSE"
-			}
-		} else {
-			s = strconv.FormatInt(n.GetInt64(), 10)
-		}
-	case types.KindUint64:
-		s = strconv.FormatUint(n.GetUint64(), 10)
-	case types.KindFloat32:
-		s = strconv.FormatFloat(n.GetFloat64(), 'e', -1, 32)
-	case types.KindFloat64:
-		s = strconv.FormatFloat(n.GetFloat64(), 'e', -1, 64)
-	case types.KindString, types.KindBytes:
-		s = strconv.Quote(n.GetString())
-	case types.KindMysqlDecimal:
-		s = n.GetMysqlDecimal().String()
-	case types.KindBinaryLiteral:
-		if n.Type.Flag&mysql.UnsignedFlag != 0 {
-			s = fmt.Sprintf("x'%x'", n.GetBytes())
-		} else {
-			s = n.GetBinaryLiteral().ToBitLiteralString(true)
-		}
-	default:
-		panic("Can't format to string")
-	}
-	fmt.Fprint(w, s)
+// ValueExpr define a interface for ValueExpr.
+type ValueExpr interface {
+	ExprNode
+	SetValue(val interface{})
+	GetValue() interface{}
+	GetDatumString() string
+	GetString() string
+	GetProjectionOffset() int
+	SetProjectionOffset(offset int)
 }
 
 // NewValueExpr creates a ValueExpr with value, and sets default field type.
-func NewValueExpr(value interface{}) *ValueExpr {
-	if ve, ok := value.(*ValueExpr); ok {
-		return ve
-	}
-	ve := &ValueExpr{}
-	ve.SetValue(value)
-	types.DefaultTypeForValue(value, &ve.Type)
-	ve.projectionOffset = -1
-	return ve
-}
+var NewValueExpr func(value interface{}, charset string, collate string) ValueExpr
 
-// SetProjectionOffset sets ValueExpr.projectionOffset for logical plan builder.
-func (n *ValueExpr) SetProjectionOffset(offset int) {
-	n.projectionOffset = offset
-}
-
-// GetProjectionOffset returns ValueExpr.projectionOffset.
-func (n *ValueExpr) GetProjectionOffset() int {
-	return n.projectionOffset
-}
-
-// Accept implements Node interface.
-func (n *ValueExpr) Accept(v Visitor) (Node, bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-	n = newNode.(*ValueExpr)
-	return v.Leave(n)
-}
-
-// Restore implements Node interface.
-func (n *ValueExpr) Restore(ctx *RestoreCtx) error {
-	switch n.Kind() {
-	case types.KindNull:
-		ctx.WriteKeyWord("NULL")
-	case types.KindInt64:
-		if n.Type.Flag&mysql.IsBooleanFlag != 0 {
-			if n.GetInt64() > 0 {
-				ctx.WriteKeyWord("TRUE")
-			} else {
-				ctx.WriteKeyWord("FALSE")
-			}
-		} else {
-			ctx.WritePlain(strconv.FormatInt(n.GetInt64(), 10))
-		}
-	case types.KindUint64:
-		ctx.WritePlain(strconv.FormatUint(n.GetUint64(), 10))
-	case types.KindFloat32:
-		ctx.WritePlain(strconv.FormatFloat(n.GetFloat64(), 'e', -1, 32))
-	case types.KindFloat64:
-		ctx.WritePlain(strconv.FormatFloat(n.GetFloat64(), 'e', -1, 64))
-	case types.KindString:
-		if n.Type.Charset != "" && n.Type.Charset != mysql.DefaultCharset {
-			ctx.WritePlain("_")
-			ctx.WriteKeyWord(n.Type.Charset)
-		}
-		ctx.WriteString(n.GetString())
-	case types.KindBytes:
-		ctx.WriteString(n.GetString())
-	case types.KindMysqlDecimal:
-		ctx.WritePlain(n.GetMysqlDecimal().String())
-	case types.KindBinaryLiteral:
-		if n.Type.Flag&mysql.UnsignedFlag != 0 {
-			ctx.WritePlainf("x'%x'", n.GetBytes())
-		} else {
-			ctx.WritePlain(n.GetBinaryLiteral().ToBitLiteralString(true))
-		}
-	case types.KindMysqlDuration, types.KindMysqlEnum,
-		types.KindMysqlBit, types.KindMysqlSet, types.KindMysqlTime,
-		types.KindInterface, types.KindMinNotNull, types.KindMaxValue,
-		types.KindRaw, types.KindMysqlJSON:
-		// TODO implement Restore function
-		return errors.New("Not implemented")
-	default:
-		return errors.New("can't format to string")
-	}
-	return nil
-}
+// NewParamMarkerExpr creates a ParamMarkerExpr.
+var NewParamMarkerExpr func(offset int) ParamMarkerExpr
 
 // BetweenExpr is for "between and" or "not between and" expression.
 type BetweenExpr struct {
@@ -194,7 +85,7 @@ type BetweenExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *BetweenExpr) Restore(ctx *RestoreCtx) error {
+func (n *BetweenExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Expr.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore BetweenExpr.Expr")
 	}
@@ -266,24 +157,37 @@ type BinaryOperationExpr struct {
 	R ExprNode
 }
 
+func restoreBinaryOpWithSpacesAround(ctx *format.RestoreCtx, op opcode.Op) error {
+	shouldInsertSpace := ctx.Flags.HasSpacesAroundBinaryOperationFlag() || op.IsKeyword()
+	if shouldInsertSpace {
+		ctx.WritePlain(" ")
+	}
+	if err := op.Restore(ctx); err != nil {
+		return err // no need to annotate, the caller will annotate.
+	}
+	if shouldInsertSpace {
+		ctx.WritePlain(" ")
+	}
+	return nil
+}
+
 // Restore implements Node interface.
-func (n *BinaryOperationExpr) Restore(ctx *RestoreCtx) error {
+func (n *BinaryOperationExpr) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasRestoreBracketAroundBinaryOperation() {
+		ctx.WritePlain("(")
+	}
 	if err := n.L.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred when restore BinaryOperationExpr.L")
 	}
-	if ctx.Flags.HasSpacesAroundBinaryOperationFlag() {
-		ctx.WritePlain(" ")
-	}
-	if err := n.Op.Restore(ctx); err != nil {
+	if err := restoreBinaryOpWithSpacesAround(ctx, n.Op); err != nil {
 		return errors.Annotate(err, "An error occurred when restore BinaryOperationExpr.Op")
-	}
-	if ctx.Flags.HasSpacesAroundBinaryOperationFlag() {
-		ctx.WritePlain(" ")
 	}
 	if err := n.R.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred when restore BinaryOperationExpr.R")
 	}
-
+	if ctx.Flags.HasRestoreBracketAroundBinaryOperation() {
+		ctx.WritePlain(")")
+	}
 	return nil
 }
 
@@ -329,7 +233,7 @@ type WhenClause struct {
 }
 
 // Restore implements Node interface.
-func (n *WhenClause) Restore(ctx *RestoreCtx) error {
+func (n *WhenClause) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("WHEN ")
 	if err := n.Expr.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore WhenClauses.Expr")
@@ -375,7 +279,7 @@ type CaseExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *CaseExpr) Restore(ctx *RestoreCtx) error {
+func (n *CaseExpr) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("CASE")
 	if n.Value != nil {
 		ctx.WritePlain(" ")
@@ -465,8 +369,10 @@ type SubqueryExpr struct {
 	Exists     bool
 }
 
+func (*SubqueryExpr) resultSet() {}
+
 // Restore implements Node interface.
-func (n *SubqueryExpr) Restore(ctx *RestoreCtx) error {
+func (n *SubqueryExpr) Restore(ctx *format.RestoreCtx) error {
 	ctx.WritePlain("(")
 	if err := n.Query.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore SubqueryExpr.Query")
@@ -512,11 +418,11 @@ type CompareSubqueryExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *CompareSubqueryExpr) Restore(ctx *RestoreCtx) error {
+func (n *CompareSubqueryExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.L.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore CompareSubqueryExpr.L")
 	}
-	if err := n.Op.Restore(ctx); err != nil {
+	if err := restoreBinaryOpWithSpacesAround(ctx, n.Op); err != nil {
 		return errors.Annotate(err, "An error occurred while restore CompareSubqueryExpr.Op")
 	}
 	if n.All {
@@ -555,6 +461,47 @@ func (n *CompareSubqueryExpr) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// TableNameExpr represents a table-level object name expression, such as sequence/table/view etc.
+type TableNameExpr struct {
+	exprNode
+
+	// Name is the referenced object name expression.
+	Name *TableName
+}
+
+// Restore implements Node interface.
+func (n *TableNameExpr) Restore(ctx *format.RestoreCtx) error {
+	if err := n.Name.Restore(ctx); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+// Format the ExprNode into a Writer.
+func (n *TableNameExpr) Format(w io.Writer) {
+	dbName, tbName := n.Name.Schema.L, n.Name.Name.L
+	if dbName == "" {
+		fmt.Fprintf(w, "`%s`", tbName)
+	} else {
+		fmt.Fprintf(w, "`%s`.`%s`", dbName, tbName)
+	}
+}
+
+// Accept implements Node Accept interface.
+func (n *TableNameExpr) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*TableNameExpr)
+	node, ok := n.Name.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Name = node.(*TableName)
+	return v.Leave(n)
+}
+
 // ColumnName represents column name.
 type ColumnName struct {
 	node
@@ -564,12 +511,12 @@ type ColumnName struct {
 }
 
 // Restore implements Node interface.
-func (n *ColumnName) Restore(ctx *RestoreCtx) error {
-	if n.Schema.O != "" {
+func (n *ColumnName) Restore(ctx *format.RestoreCtx) error {
+	if n.Schema.O != "" && !ctx.IsCTETableName(n.Table.L) && !ctx.Flags.HasWithoutSchemaNameFlag() {
 		ctx.WriteName(n.Schema.O)
 		ctx.WritePlain(".")
 	}
-	if n.Table.O != "" {
+	if n.Table.O != "" && !ctx.Flags.HasWithoutTableNameFlag() {
 		ctx.WriteName(n.Table.O)
 		ctx.WritePlain(".")
 	}
@@ -626,7 +573,7 @@ type ColumnNameExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *ColumnNameExpr) Restore(ctx *RestoreCtx) error {
+func (n *ColumnNameExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Name.Restore(ctx); err != nil {
 		return errors.Trace(err)
 	}
@@ -635,7 +582,7 @@ func (n *ColumnNameExpr) Restore(ctx *RestoreCtx) error {
 
 // Format the ExprNode into a Writer.
 func (n *ColumnNameExpr) Format(w io.Writer) {
-	name := strings.Replace(n.Name.String(), ".", "`.`", -1)
+	name := strings.ReplaceAll(n.Name.String(), ".", "`.`")
 	fmt.Fprintf(w, "`%s`", name)
 }
 
@@ -662,7 +609,7 @@ type DefaultExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *DefaultExpr) Restore(ctx *RestoreCtx) error {
+func (n *DefaultExpr) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("DEFAULT")
 	if n.Name != nil {
 		ctx.WritePlain("(")
@@ -676,7 +623,10 @@ func (n *DefaultExpr) Restore(ctx *RestoreCtx) error {
 
 // Format the ExprNode into a Writer.
 func (n *DefaultExpr) Format(w io.Writer) {
-	panic("Not implemented")
+	fmt.Fprint(w, "DEFAULT")
+	if n.Name != nil {
+		panic("Not implemented")
+	}
 }
 
 // Accept implements Node Accept interface.
@@ -686,13 +636,6 @@ func (n *DefaultExpr) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*DefaultExpr)
-	if n.Name != nil {
-		node, ok := n.Name.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Name = node.(*ColumnName)
-	}
 	return v.Leave(n)
 }
 
@@ -707,7 +650,7 @@ type ExistsSubqueryExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *ExistsSubqueryExpr) Restore(ctx *RestoreCtx) error {
+func (n *ExistsSubqueryExpr) Restore(ctx *format.RestoreCtx) error {
 	if n.Not {
 		ctx.WriteKeyWord("NOT EXISTS ")
 	} else {
@@ -753,7 +696,7 @@ type PatternInExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *PatternInExpr) Restore(ctx *RestoreCtx) error {
+func (n *PatternInExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Expr.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore PatternInExpr.Expr")
 	}
@@ -837,7 +780,7 @@ type IsNullExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *IsNullExpr) Restore(ctx *RestoreCtx) error {
+func (n *IsNullExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Expr.Restore(ctx); err != nil {
 		return errors.Trace(err)
 	}
@@ -886,7 +829,7 @@ type IsTruthExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *IsTruthExpr) Restore(ctx *RestoreCtx) error {
+func (n *IsTruthExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Expr.Restore(ctx); err != nil {
 		return errors.Trace(err)
 	}
@@ -933,8 +876,8 @@ func (n *IsTruthExpr) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// PatternLikeExpr is the expression for like operator, e.g, expr like "%123%"
-type PatternLikeExpr struct {
+// PatternLikeOrIlikeExpr is the expression for like operator, e.g, expr like "%123%"
+type PatternLikeOrIlikeExpr struct {
 	exprNode
 	// Expr is the expression to be checked.
 	Expr ExprNode
@@ -943,6 +886,8 @@ type PatternLikeExpr struct {
 	// Not is true, the expression is "not like".
 	Not bool
 
+	IsLike bool
+
 	Escape byte
 
 	PatChars []byte
@@ -950,38 +895,54 @@ type PatternLikeExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *PatternLikeExpr) Restore(ctx *RestoreCtx) error {
+func (n *PatternLikeOrIlikeExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Expr.Restore(ctx); err != nil {
-		return errors.Annotate(err, "An error occurred while restore PatternLikeExpr.Expr")
+		return errors.Annotate(err, "An error occurred while restore PatternLikeOrIlikeExpr.Expr")
 	}
 
-	if n.Not {
-		ctx.WriteKeyWord(" NOT LIKE ")
+	if n.IsLike {
+		if n.Not {
+			ctx.WriteKeyWord(" NOT LIKE ")
+		} else {
+			ctx.WriteKeyWord(" LIKE ")
+		}
 	} else {
-		ctx.WriteKeyWord(" LIKE ")
+		if n.Not {
+			ctx.WriteKeyWord(" NOT ILIKE ")
+		} else {
+			ctx.WriteKeyWord(" ILIKE ")
+		}
 	}
 
 	if err := n.Pattern.Restore(ctx); err != nil {
-		return errors.Annotate(err, "An error occurred while restore PatternLikeExpr.Pattern")
+		return errors.Annotate(err, "An error occurred while restore PatternLikeOrIlikeExpr.Pattern")
 	}
 
 	escape := string(n.Escape)
 	if escape != "\\" {
 		ctx.WriteKeyWord(" ESCAPE ")
 		ctx.WriteString(escape)
-
 	}
 	return nil
 }
 
 // Format the ExprNode into a Writer.
-func (n *PatternLikeExpr) Format(w io.Writer) {
+func (n *PatternLikeOrIlikeExpr) Format(w io.Writer) {
 	n.Expr.Format(w)
-	if n.Not {
-		fmt.Fprint(w, " NOT LIKE ")
+	if n.IsLike {
+		if n.Not {
+			fmt.Fprint(w, " NOT LIKE ")
+		} else {
+			fmt.Fprint(w, " LIKE ")
+		}
 	} else {
-		fmt.Fprint(w, " LIKE ")
+		if n.Not {
+			fmt.Fprint(w, " NOT ILIKE ")
+		} else {
+			fmt.Fprint(w, " ILIKE ")
+		}
 	}
+
 	n.Pattern.Format(w)
 	if n.Escape != '\\' {
 		fmt.Fprint(w, " ESCAPE ")
@@ -990,12 +951,12 @@ func (n *PatternLikeExpr) Format(w io.Writer) {
 }
 
 // Accept implements Node Accept interface.
-func (n *PatternLikeExpr) Accept(v Visitor) (Node, bool) {
+func (n *PatternLikeOrIlikeExpr) Accept(v Visitor) (Node, bool) {
 	newNode, skipChildren := v.Enter(n)
 	if skipChildren {
 		return v.Leave(newNode)
 	}
-	n = newNode.(*PatternLikeExpr)
+	n = newNode.(*PatternLikeOrIlikeExpr)
 	if n.Expr != nil {
 		node, ok := n.Expr.Accept(v)
 		if !ok {
@@ -1015,36 +976,12 @@ func (n *PatternLikeExpr) Accept(v Visitor) (Node, bool) {
 
 // ParamMarkerExpr expression holds a place for another expression.
 // Used in parsing prepare statement.
-type ParamMarkerExpr struct {
-	exprNode
-	Offset int
-	Order  int
+type ParamMarkerExpr interface {
+	ValueExpr
+	SetOrder(int)
 }
 
-// Format the ExprNode into a Writer.
-func (n *ParamMarkerExpr) Format(w io.Writer) {
-	panic("Not implemented")
-}
-
-// Accept implements Node Accept interface.
-func (n *ParamMarkerExpr) Accept(v Visitor) (Node, bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-	n = newNode.(*ParamMarkerExpr)
-	return v.Leave(n)
-}
-
-// Restore implements ParamMarkerExpr Restore interface.
-func (n *ParamMarkerExpr) Restore(ctx *RestoreCtx) error {
-	// if err := n.exprNode.Restore(ctx); err != nil {
-	// 	return errors.Annotate(err, "An error occurred when restore ParamMarkerExpr.Expr")
-	// }
-	return nil
-}
-
-// ParenthesesExpr is the parentheses expression.
+// ParenthesesExpr is the parentheses' expression.
 type ParenthesesExpr struct {
 	exprNode
 	// Expr is the expression in parentheses.
@@ -1052,7 +989,7 @@ type ParenthesesExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *ParenthesesExpr) Restore(ctx *RestoreCtx) error {
+func (n *ParenthesesExpr) Restore(ctx *format.RestoreCtx) error {
 	ctx.WritePlain("(")
 	if err := n.Expr.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred when restore ParenthesesExpr.Expr")
@@ -1099,7 +1036,7 @@ type PositionExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *PositionExpr) Restore(ctx *RestoreCtx) error {
+func (n *PositionExpr) Restore(ctx *format.RestoreCtx) error {
 	ctx.WritePlainf("%d", n.N)
 	return nil
 }
@@ -1143,7 +1080,7 @@ type PatternRegexpExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *PatternRegexpExpr) Restore(ctx *RestoreCtx) error {
+func (n *PatternRegexpExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Expr.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore PatternRegexpExpr.Expr")
 	}
@@ -1201,7 +1138,7 @@ type RowExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *RowExpr) Restore(ctx *RestoreCtx) error {
+func (n *RowExpr) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("ROW")
 	ctx.WritePlain("(")
 	for i, v := range n.Values {
@@ -1248,7 +1185,7 @@ type UnaryOperationExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *UnaryOperationExpr) Restore(ctx *RestoreCtx) error {
+func (n *UnaryOperationExpr) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Op.Restore(ctx); err != nil {
 		return errors.Trace(err)
 	}
@@ -1287,7 +1224,7 @@ type ValuesExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *ValuesExpr) Restore(ctx *RestoreCtx) error {
+func (n *ValuesExpr) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("VALUES")
 	ctx.WritePlain("(")
 	if err := n.Column.Restore(ctx); err != nil {
@@ -1314,9 +1251,9 @@ func (n *ValuesExpr) Accept(v Visitor) (Node, bool) {
 	if !ok {
 		return n, false
 	}
-	// `node` may be *ast.ValueExpr, to avoid panic, we write `ok` but do not use
+	// `node` may be *ast.ValueExpr, to avoid panic, we write `_` and do not use
 	// it.
-	n.Column, ok = node.(*ColumnNameExpr)
+	n.Column, _ = node.(*ColumnNameExpr)
 	return v.Leave(n)
 }
 
@@ -1336,7 +1273,7 @@ type VariableExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *VariableExpr) Restore(ctx *RestoreCtx) error {
+func (n *VariableExpr) Restore(ctx *format.RestoreCtx) error {
 	if n.IsSystem {
 		ctx.WritePlain("@@")
 		if n.ExplicitScope {
@@ -1392,7 +1329,7 @@ type MaxValueExpr struct {
 }
 
 // Restore implements Node interface.
-func (n *MaxValueExpr) Restore(ctx *RestoreCtx) error {
+func (n *MaxValueExpr) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("MAXVALUE")
 	return nil
 }
@@ -1409,4 +1346,162 @@ func (n *MaxValueExpr) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	return v.Leave(n)
+}
+
+// MatchAgainst is the expression for matching against fulltext index.
+type MatchAgainst struct {
+	exprNode
+	// ColumnNames are the columns to match.
+	ColumnNames []*ColumnName
+	// Against
+	Against ExprNode
+	// Modifier
+	Modifier FulltextSearchModifier
+}
+
+func (n *MatchAgainst) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("MATCH")
+	ctx.WritePlain(" (")
+	for i, v := range n.ColumnNames {
+		if i != 0 {
+			ctx.WritePlain(",")
+		}
+		if err := v.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore MatchAgainst.ColumnNames[%d]", i)
+		}
+	}
+	ctx.WritePlain(") ")
+	ctx.WriteKeyWord("AGAINST")
+	ctx.WritePlain(" (")
+	if err := n.Against.Restore(ctx); err != nil {
+		return errors.Annotate(err, "An error occurred while restore MatchAgainst.Against")
+	}
+	if n.Modifier.IsBooleanMode() {
+		ctx.WritePlain(" IN BOOLEAN MODE")
+		if n.Modifier.WithQueryExpansion() {
+			return errors.New("BOOLEAN MODE doesn't support QUERY EXPANSION")
+		}
+	} else if n.Modifier.WithQueryExpansion() {
+		ctx.WritePlain(" WITH QUERY EXPANSION")
+	}
+	ctx.WritePlain(")")
+	return nil
+}
+
+func (n *MatchAgainst) Format(w io.Writer) {
+	fmt.Fprint(w, "MATCH(")
+	for i, v := range n.ColumnNames {
+		if i != 0 {
+			fmt.Fprintf(w, ",%s", v.String())
+		} else {
+			fmt.Fprint(w, v.String())
+		}
+	}
+	fmt.Fprint(w, ") AGAINST(")
+	n.Against.Format(w)
+	if n.Modifier.IsBooleanMode() {
+		fmt.Fprint(w, " IN BOOLEAN MODE")
+	} else if n.Modifier.WithQueryExpansion() {
+		fmt.Fprint(w, " WITH QUERY EXPANSION")
+	}
+	fmt.Fprint(w, ")")
+}
+
+func (n *MatchAgainst) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*MatchAgainst)
+	for i, colName := range n.ColumnNames {
+		newColName, ok := colName.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.ColumnNames[i] = newColName.(*ColumnName)
+	}
+	newAgainst, ok := n.Against.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Against = newAgainst.(ExprNode)
+	return v.Leave(n)
+}
+
+// SetCollationExpr is the expression for the `COLLATE collation_name` clause.
+type SetCollationExpr struct {
+	exprNode
+	// Expr is the expression to be set.
+	Expr ExprNode
+	// Collate is the name of collation to set.
+	Collate string
+}
+
+// Restore implements Node interface.
+func (n *SetCollationExpr) Restore(ctx *format.RestoreCtx) error {
+	if err := n.Expr.Restore(ctx); err != nil {
+		return errors.Trace(err)
+	}
+	ctx.WriteKeyWord(" COLLATE ")
+	ctx.WritePlain(n.Collate)
+	return nil
+}
+
+// Format the ExprNode into a Writer.
+func (n *SetCollationExpr) Format(w io.Writer) {
+	n.Expr.Format(w)
+	fmt.Fprintf(w, " COLLATE %s", n.Collate)
+}
+
+// Accept implements Node Accept interface.
+func (n *SetCollationExpr) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*SetCollationExpr)
+	node, ok := n.Expr.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Expr = node.(ExprNode)
+	return v.Leave(n)
+}
+
+type exprTextPositionCleaner struct {
+	oldTextPos []int
+	restore    bool
+}
+
+func (e *exprTextPositionCleaner) BeginRestore() {
+	e.restore = true
+}
+
+func (e *exprTextPositionCleaner) Enter(n Node) (node Node, skipChildren bool) {
+	if e.restore {
+		n.SetOriginTextPosition(e.oldTextPos[0])
+		e.oldTextPos = e.oldTextPos[1:]
+		return n, false
+	}
+	e.oldTextPos = append(e.oldTextPos, n.OriginTextPosition())
+	n.SetOriginTextPosition(0)
+	return n, false
+}
+
+func (e *exprTextPositionCleaner) Leave(n Node) (node Node, ok bool) {
+	return n, true
+}
+
+// ExpressionDeepEqual compares the equivalence of two expressions.
+func ExpressionDeepEqual(a ExprNode, b ExprNode) bool {
+	cleanerA := &exprTextPositionCleaner{}
+	cleanerB := &exprTextPositionCleaner{}
+	a.Accept(cleanerA)
+	b.Accept(cleanerB)
+	result := reflect.DeepEqual(a, b)
+	cleanerA.BeginRestore()
+	cleanerB.BeginRestore()
+	a.Accept(cleanerA)
+	b.Accept(cleanerB)
+	return result
 }

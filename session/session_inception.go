@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
-	"database/sql/driver"
+	sqldriver "database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -30,6 +30,7 @@ import (
 	"github.com/hanchuanchuan/goInception/parser/opcode"
 	"github.com/hanchuanchuan/goInception/sessionctx/variable"
 	"github.com/hanchuanchuan/goInception/types"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/util"
 	"github.com/hanchuanchuan/goInception/util/auth"
 	"github.com/hanchuanchuan/goInception/util/charset"
@@ -520,7 +521,7 @@ func (s *session) isRunToTiDB(stmtNode ast.StmtNode) (is bool, isFlush bool) {
 	case *ast.ExplainStmt:
 		return true, false
 
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		return true, false
 
 	case *ast.SelectStmt:
@@ -595,10 +596,15 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 	case *ast.UpdateStmt:
 		s.checkUpdate(node, currentSql)
 
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		for _, sel := range node.SelectList.Selects {
-			if sel.Fields != nil {
-				for _, field := range sel.Fields.Fields {
+			// The upstream parser types the operands as ast.Node.
+			selectStmt, ok := sel.(*ast.SelectStmt)
+			if !ok {
+				continue
+			}
+			if selectStmt.Fields != nil {
+				for _, field := range selectStmt.Fields.Fields {
 					if field.WildCard != nil {
 						s.appendErrorNo(ER_SELECT_ONLY_STAR)
 					}
@@ -653,7 +659,7 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 
 	case *ast.CreateIndexStmt:
 		tp := ast.ConstraintIndex
-		if node.Unique {
+		if node.KeyType == ast.IndexKeyTypeUnique {
 			tp = ast.ConstraintUniq
 		}
 		if node.KeyType == ast.IndexKeyTypeFullText {
@@ -661,12 +667,12 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 		}
 		if !s.inc.AlterAutoMerge { // jwx added
 			s.checkCreateIndex(node.Table, node.IndexName,
-				node.IndexColNames, node.IndexOption, nil, node.Unique, tp)
+				node.IndexPartSpecifications, node.IndexOption, nil, node.KeyType == ast.IndexKeyTypeUnique, tp)
 		} else {
 			alter := s.convertCreateIndexToAlterTable(node)
 			s.checkAlterTable(alter, node.Text(), true)
 			s.checkCreateIndex(node.Table, node.IndexName,
-				node.IndexColNames, node.IndexOption, nil, node.Unique, tp)
+				node.IndexPartSpecifications, node.IndexOption, nil, node.KeyType == ast.IndexKeyTypeUnique, tp)
 		}
 
 	case *ast.DropIndexStmt:
@@ -2833,7 +2839,7 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 							// 		node.Table.Schema, node.Table.Name)
 							// }
 							// case ast.ColumnOptionDefaultValue:
-							// 	if op.Expr.GetDatum().IsNull() {
+							// 	if exprDatum(op.Expr).IsNull() {
 							// 		defaultNullValue = true
 							// 	}
 						}
@@ -2901,7 +2907,7 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 								if !hasNullFlag && !hasDefault {
 									// 指定默认值为0000-00-00 00:00:00
 									field.Options = append(field.Options,
-										&ast.ColumnOption{Tp: ast.ColumnOptionDefaultValue, Expr: ast.NewValueExpr(types.ZeroDatetimeStr)})
+										&ast.ColumnOption{Tp: ast.ColumnOptionDefaultValue, Expr: ast.NewValueExpr(types.ZeroDatetimeStr, "", "")})
 								}
 							}
 						}
@@ -2927,13 +2933,13 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 						switch op.Tp {
 						case ast.ColumnOptionPrimaryKey:
 							s.checkCreateIndex(nil, "PRIMARY",
-								[]*ast.IndexColName{
+								[]*ast.IndexPartSpecification{
 									{Column: field.Name,
 										Length: types.UnspecifiedLength},
 								}, nil, table, true, ast.ConstraintPrimaryKey)
 						case ast.ColumnOptionUniqKey:
 							s.checkCreateIndex(nil, field.Name.String(),
-								[]*ast.IndexColName{
+								[]*ast.IndexPartSpecification{
 									{Column: field.Name, Length: types.UnspecifiedLength},
 								}, nil, table, true, ast.ConstraintUniq)
 
@@ -3296,7 +3302,7 @@ func (s *session) buildPartitionInfo(def *ast.PartitionOptions,
 			partValues := make([]string, 0)
 			for _, values := range clause.Values {
 				for _, v := range values {
-					key := fmt.Sprintf("%v", v.GetValue())
+					key := fmt.Sprintf("%v", exprValue(v))
 					partValues = append(partValues, key)
 				}
 			}
@@ -3304,7 +3310,7 @@ func (s *session) buildPartitionInfo(def *ast.PartitionOptions,
 
 		case *ast.PartitionDefinitionClauseLessThan:
 			for _, v := range clause.Exprs {
-				p.PartDescription = fmt.Sprintf("%v", v.GetValue())
+				p.PartDescription = fmt.Sprintf("%v", exprValue(v))
 				break
 			}
 		}
@@ -3883,7 +3889,7 @@ func (s *session) checkAlterTableAlterColumn(t *TableInfo, c *ast.AlterTableSpec
 			} else {
 				// "SET" "DEFAULT" SignedLiteral
 				for _, op := range nc.Options {
-					defaultValue := fmt.Sprint(op.Expr.GetValue())
+					defaultValue := fmt.Sprint(exprValue(op.Expr))
 					if len(defaultValue) == 0 {
 						switch strings.Split(foundField.Type, "(")[0] {
 						case "bit", "smallint", "mediumint", "int",
@@ -4542,7 +4548,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef, alterTable
 
 			switch op.Tp {
 			case ast.ColumnOptionComment:
-				if op.Expr.GetDatum().GetString() != "" {
+				if exprDatum(op.Expr).GetString() != "" {
 					hasComment = true
 				}
 			case ast.ColumnOptionNotNull:
@@ -4553,14 +4559,14 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef, alterTable
 				autoIncrement = true
 			case ast.ColumnOptionDefaultValue:
 				defaultExpr = op.Expr
-				defaultValue = op.Expr.GetDatum()
+				defaultValue = exprDatum(op.Expr)
 				hasDefaultValue = true
 			case ast.ColumnOptionOnUpdate:
 				if funcCall, ok := op.Expr.(*ast.FuncCallExpr); ok {
 					var num int64
 					if len(funcCall.Args) == 1 {
 						v := funcCall.Args[0]
-						num = v.GetDatum().GetInt64()
+						num = exprDatum(v).GetInt64()
 					}
 					if int(num) != field.Tp.Decimal && !(field.Tp.Decimal == -1 && num == 0) {
 						s.appendErrorMsg(
@@ -4605,7 +4611,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef, alterTable
 			var num int64
 			if len(funcCall.Args) == 1 {
 				v := funcCall.Args[0]
-				num = v.GetDatum().GetInt64()
+				num = exprDatum(v).GetInt64()
 			}
 			if int(num) != field.Tp.Decimal && !(field.Tp.Decimal == -1 && num == 0) {
 				log.Errorf("num: %v, tp.decimal: %v", num, field.Tp.Decimal)
@@ -4615,7 +4621,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef, alterTable
 	}
 
 	//有默认值，且为NULL，且有NOT NULL约束，如(not null default null)
-	if _, ok := defaultExpr.(*ast.ValueExpr); ok && hasDefaultValue && defaultValue.IsNull() && notNullFlag {
+	if _, ok := defaultExpr.(*driver.ValueExpr); ok && hasDefaultValue && defaultValue.IsNull() && notNullFlag {
 		s.appendErrorNo(ER_INVALID_DEFAULT, field.Name.Name.O)
 	}
 
@@ -4626,7 +4632,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef, alterTable
 	}
 
 	//有默认值，且不为NULL
-	if _, ok := defaultExpr.(*ast.ValueExpr); ok && hasDefaultValue && !defaultValue.IsNull() {
+	if _, ok := defaultExpr.(*driver.ValueExpr); ok && hasDefaultValue && !defaultValue.IsNull() {
 		switch field.Tp.Tp {
 		case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24,
 			mysql.TypeLong, mysql.TypeLonglong,
@@ -4742,7 +4748,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef, alterTable
 		} else if hasDefaultValue {
 			// v5.6在使用default null后即使指定on update仍会报错
 			// https://github.com/hanchuanchuan/goInception/issues/406
-			if _, ok := defaultExpr.(*ast.ValueExpr); ok &&
+			if _, ok := defaultExpr.(*driver.ValueExpr); ok &&
 				defaultValue.IsNull() && !notNullFlag && s.dbVersion < 50700 {
 				//有默认值，且为NULL，且有NOT NULL约束，如(not null default null)
 				s.appendErrorNo(ER_INVALID_DEFAULT, field.Name.Name.O)
@@ -4769,7 +4775,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef, alterTable
 }
 
 func (s *session) checkIndexAttr(tp ast.ConstraintType, name string,
-	keys []*ast.IndexColName, table *TableInfo) {
+	keys []*ast.IndexPartSpecification, table *TableInfo) {
 
 	if tp == ast.ConstraintPrimaryKey {
 
@@ -4858,7 +4864,7 @@ func (s *session) checkIndexAttr(tp ast.ConstraintType, name string,
 }
 
 /* 检查当前索引是否与已存在的索引存在字段重复, 比如(a,b) 与 (a)是存在重复的 */
-func (s *session) checkDupColumnIndex(t *TableInfo, name string, keys []*ast.IndexColName) {
+func (s *session) checkDupColumnIndex(t *TableInfo, name string, keys []*ast.IndexPartSpecification) {
 	columns := ""
 	for _, c := range keys {
 		columns += c.Column.Name.String() + ","
@@ -4909,7 +4915,7 @@ func (s *session) checkCreateForeignKey(t *TableInfo, c *ast.Constraint) {
 
 	refTable := s.getTableFromCache(c.Refer.Table.Schema.O, c.Refer.Table.Name.O, true)
 	if refTable != nil {
-		for _, col := range c.Refer.IndexColNames {
+		for _, col := range c.Refer.IndexPartSpecifications {
 			found := false
 			for _, field := range refTable.Fields {
 				if strings.EqualFold(field.Field, col.Column.Name.O) {
@@ -4922,7 +4928,7 @@ func (s *session) checkCreateForeignKey(t *TableInfo, c *ast.Constraint) {
 			}
 		}
 	}
-	if len(c.Keys) != len(c.Refer.IndexColNames) {
+	if len(c.Keys) != len(c.Refer.IndexPartSpecifications) {
 		s.appendErrorNo(ErrWrongFkDefWithMatch, c.Name)
 	}
 
@@ -5323,7 +5329,7 @@ func (s *session) checkDropIndex(node *ast.DropIndexStmt, sql string) {
 }
 
 func (s *session) checkCreateIndex(table *ast.TableName, IndexName string,
-	IndexColNames []*ast.IndexColName, indexOption *ast.IndexOption,
+	IndexPartSpecifications []*ast.IndexPartSpecification, indexOption *ast.IndexOption,
 	t *TableInfo, unique bool, tp ast.ConstraintType) {
 	log.Debug("checkCreateIndex")
 
@@ -5344,13 +5350,13 @@ func (s *session) checkCreateIndex(table *ast.TableName, IndexName string,
 		IndexName = "PRIMARY"
 	}
 
-	s.checkIndexAttr(tp, IndexName, IndexColNames, t)
+	s.checkIndexAttr(tp, IndexName, IndexPartSpecifications, t)
 
 	keyMaxLen := 0
 	// 禁止使用blob列当索引,所以不再检测blob字段时列是否过长
 	isBlobColumn := false
 	isOverflowIndexLength := false
-	for _, col := range IndexColNames {
+	for _, col := range IndexPartSpecifications {
 		found := false
 		var foundField FieldInfo
 
@@ -5535,7 +5541,7 @@ func (s *session) checkCreateIndex(table *ast.TableName, IndexName string,
 		indexType = "SPATIAL"
 	}
 	// cache new index
-	for i, col := range IndexColNames {
+	for i, col := range IndexPartSpecifications {
 		index := &IndexInfo{
 			Table: t.Name,
 			// NonUnique:  unique  ,
@@ -5595,12 +5601,17 @@ func (s *session) checkCreateView(node *ast.CreateViewStmt, sql string) {
 	}
 
 	switch selectNode := node.Select.(type) {
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		for _, sel := range selectNode.SelectList.Selects {
 			// 是否有星号列
 			hasWildCard := false
-			if sel.Fields != nil {
-				for _, field := range sel.Fields.Fields {
+			// The upstream parser types the operands as ast.Node.
+			selectStmt, ok := sel.(*ast.SelectStmt)
+			if !ok {
+				continue
+			}
+			if selectStmt.Fields != nil {
+				for _, field := range selectStmt.Fields.Fields {
 					if field.WildCard != nil {
 						hasWildCard = true
 					}
@@ -5609,11 +5620,11 @@ func (s *session) checkCreateView(node *ast.CreateViewStmt, sql string) {
 				if hasWildCard {
 					s.appendErrorNo(ER_SELECT_ONLY_STAR)
 
-					selectColumnCount, err := s.subSelectColumns(sel)
+					selectColumnCount, err := s.subSelectColumns(selectStmt)
 					if err == nil && fieldCount > 0 && fieldCount != selectColumnCount {
 						s.appendErrorNo(ErrViewColumnCount)
 					}
-				} else if fieldCount > 0 && fieldCount != len(sel.Fields.Fields) {
+				} else if fieldCount > 0 && fieldCount != len(selectStmt.Fields.Fields) {
 					// 判断字段数是否匹配
 					s.appendErrorNo(ErrViewColumnCount)
 				}
@@ -5662,8 +5673,8 @@ func (s *session) checkCreateView(node *ast.CreateViewStmt, sql string) {
 					IsNew: true,
 				}
 			}
-		} else {
-			cols := s.getSubSelectColumns(node.Select)
+		} else if resultSet, ok := node.Select.(ast.ResultSetNode); ok {
+			cols := s.getSubSelectColumns(resultSet)
 			table.Fields = make([]FieldInfo, len(cols))
 			for index, field := range cols {
 				table.Fields[index] = FieldInfo{
@@ -5711,12 +5722,12 @@ func (s *session) convertCreateIndexToAlterTable(node *ast.CreateIndexStmt) *ast
 	var spec *ast.AlterTableSpec = &ast.AlterTableSpec{Tp: ast.AlterTableAddConstraint, Constraint: &ast.Constraint{}}
 	spec.IfNotExists = node.IfNotExists
 	spec.Constraint.Name = node.IndexName
-	if node.Unique {
+	if node.KeyType == ast.IndexKeyTypeUnique {
 		spec.Constraint.Tp = ast.ConstraintUniq
 	} else {
 		spec.Constraint.Tp = ast.ConstraintIndex
 	}
-	spec.Constraint.Keys = node.IndexColNames
+	spec.Constraint.Keys = node.IndexPartSpecifications
 	spec.Constraint.Option = node.IndexOption
 	if node.LockAlg != nil {
 		spec.LockType = node.LockAlg.LockTp
@@ -5726,7 +5737,7 @@ func (s *session) convertCreateIndexToAlterTable(node *ast.CreateIndexStmt) *ast
 		spec.Algorithm = 0
 	}
 	spec.Partition = node.Partition
-	alter.SetText(node.Text())
+	alter.SetText(nil, node.Text())
 	alter.Table = node.Table
 	alter.Specs = append(alter.Specs, spec)
 	return alter
@@ -5745,7 +5756,7 @@ func (s *session) convertDropIndexToAlterTable(node *ast.DropIndexStmt) *ast.Alt
 		spec.LockType = 0
 		spec.Algorithm = 0
 	}
-	alter.SetText(node.Text())
+	alter.SetText(nil, node.Text())
 	alter.Table = node.Table
 	alter.Specs = append(alter.Specs, spec)
 	return alter
@@ -5912,7 +5923,7 @@ func (s *session) checkInsert(node *ast.InsertStmt, sql string) {
 			for colIndex, vv := range list {
 				s.checkItem(vv, []*TableInfo{table})
 
-				if v, ok := vv.(*ast.ValueExpr); ok {
+				if v, ok := vv.(*driver.ValueExpr); ok {
 					// name := node.Columns[colIndex].Name.L
 					name := strings.ToLower(fields[colIndex].Field)
 					if v.Type.Tp == mysql.TypeNull {
@@ -5925,7 +5936,7 @@ func (s *session) checkInsert(node *ast.InsertStmt, sql string) {
 						if tp, ok := columnsIsDate[name]; ok {
 							_, err := GetTimeValue(s, v, tp, v.Type.Decimal)
 							if err != nil {
-								s.appendErrorNo(ErrIncorrectDateTimeValue, v.GetValue(), node.Columns[colIndex])
+								s.appendErrorNo(ErrIncorrectDateTimeValue, exprValue(v), node.Columns[colIndex])
 								continue
 							}
 							// 二次校验是否为有效datetime
@@ -5941,10 +5952,10 @@ func (s *session) checkInsert(node *ast.InsertStmt, sql string) {
 								switch fieldType {
 								case "bit", "tinyint", "smallint", "mediumint", "int", "integer",
 									"bigint", "decimal", "float", "double", "real":
-									if !IsNumeric(v.GetValue()) {
+									if !IsNumeric(exprValue(v)) {
 										s.appendErrorMsg(
 											fmt.Sprintf("Incorrect integer value: '%v' for column '%s' at row %v",
-												v.GetValue(), fields[colIndex].Field, i+1))
+												exprValue(v), fields[colIndex].Field, i+1))
 									}
 								}
 							}
@@ -5966,8 +5977,10 @@ func (s *session) checkInsert(node *ast.InsertStmt, sql string) {
 	if node.Select != nil {
 		sel, ok := node.Select.(*ast.SelectStmt)
 		if !ok {
-			if u, ok := node.Select.(*ast.UnionStmt); ok {
-				sel = u.SelectList.Selects[0]
+			if u, ok := node.Select.(*ast.SetOprStmt); ok {
+				if first, ok2 := setOprFirstSelect(u); ok2 {
+					sel, _ = first.(*ast.SelectStmt)
+				}
 			}
 		}
 
@@ -6127,9 +6140,12 @@ func (s *session) getTableList(tableList []*ast.TableSource) ([]*TableInfo, bool
 // subSelectColumns 计算子查询的列数(包含有星号列)
 func (s *session) subSelectColumns(node ast.ResultSetNode) (int, error) {
 	switch sel := node.(type) {
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		// 取第一个select的列数
-		return s.subSelectColumns(sel.SelectList.Selects[0])
+		if first, ok := setOprFirstSelect(sel); ok {
+			return s.subSelectColumns(first)
+		}
+		return 0, errors.New("no select in set operation")
 
 	case *ast.SelectStmt:
 
@@ -6229,9 +6245,12 @@ func (s *session) getSubSelectColumns(node ast.ResultSetNode) []string {
 	columns := []string{}
 
 	switch sel := node.(type) {
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		// 取第一个select的列数
-		return s.getSubSelectColumns(sel.SelectList.Selects[0])
+		if first, ok := setOprFirstSelect(sel); ok {
+			return s.getSubSelectColumns(first)
+		}
+		return columns
 
 	case *ast.SelectStmt:
 		// var tableList []*ast.TableSource
@@ -6351,8 +6370,8 @@ func (s *session) checkDropDB(node *ast.DropDatabaseStmt, sql string) {
 		return
 	}
 
-	if s.checkDBExists(node.Name, !node.IfExists) {
-		s.dbCacheList[strings.ToLower(node.Name)].IsDeleted = true
+	if s.checkDBExists(node.Name.O, !node.IfExists) {
+		s.dbCacheList[strings.ToLower(node.Name.O)].IsDeleted = true
 	}
 }
 
@@ -6373,13 +6392,13 @@ func (s *session) executeInceptionSet(node *ast.InceptionSetStmt, sql string) ([
 			v.IsGlobal = true
 		}
 
-		var value *ast.ValueExpr
+		var value *driver.ValueExpr
 
 		switch expr := v.Value.(type) {
-		case *ast.ValueExpr:
+		case *driver.ValueExpr:
 			value = expr
 		case *ast.UnaryOperationExpr:
-			value, _ = expr.V.(*ast.ValueExpr)
+			value, _ = expr.V.(*driver.ValueExpr)
 			if expr.Op == opcode.Minus {
 				value.Datum = types.NewIntDatum(value.GetInt64() * -1)
 			}
@@ -6459,7 +6478,7 @@ func (s *session) executeInceptionSet(node *ast.InceptionSetStmt, sql string) ([
 }
 
 func (s *session) setVariableValue(t reflect.Type, values reflect.Value,
-	name string, value *ast.ValueExpr) error {
+	name string, value *driver.ValueExpr) error {
 
 	found := false
 	for i := 0; i < values.NumField(); i++ {
@@ -6620,7 +6639,7 @@ func (s *session) showVariables(node *ast.ShowStmt, obj interface{}, res *Variab
 	)
 	if node.Pattern != nil {
 		if node.Pattern.Pattern != nil {
-			va, _ := node.Pattern.Pattern.(*ast.ValueExpr)
+			va, _ := node.Pattern.Pattern.(*driver.ValueExpr)
 			like = va.GetString()
 		}
 		patChars, patTypes = stringutil.CompilePattern(like, node.Pattern.Escape)
@@ -6767,7 +6786,7 @@ func (s *session) filterExprNode(expr ast.ExprNode, colNames []string, values []
 				return false, err
 			}
 			if colIndex > -1 {
-				if v, ok := x.R.(*ast.ValueExpr); ok {
+				if v, ok := x.R.(*driver.ValueExpr); ok {
 					sVal, _ := v.ToString()
 					if sVal == values[colIndex] {
 						return true, nil
@@ -6778,13 +6797,13 @@ func (s *session) filterExprNode(expr ast.ExprNode, colNames []string, values []
 			log.Info(x)
 			return false, errors.New("不支持的操作")
 		}
-	case *ast.PatternLikeExpr:
+	case *ast.PatternLikeOrIlikeExpr:
 		colIndex, err := s.checkColumnName(x.Expr, colNames)
 		if err != nil {
 			return false, err
 		}
 		if colIndex > -1 {
-			if v, ok := x.Pattern.(*ast.ValueExpr); ok {
+			if v, ok := x.Pattern.(*driver.ValueExpr); ok {
 				like := strings.ToLower(v.GetString())
 				patChars, patTypes := stringutil.CompilePattern(like, x.Escape)
 				match := stringutil.DoMatch(strings.ToLower(values[colIndex]), patChars, patTypes)
@@ -7063,7 +7082,7 @@ func (s *session) executeInceptionShow(sql string) ([]sqlexec.RecordSet, error) 
 				return nil, nil
 			}
 
-			var vv []driver.Value
+			var vv []sqldriver.Value
 			for i := range cols {
 				val := columnPointers[i].(*interface{})
 				vv = append(vv, *val)
@@ -7087,12 +7106,12 @@ func (s *session) executeInceptionShow(sql string) ([]sqlexec.RecordSet, error) 
 func (s *session) checkCreateDB(node *ast.CreateDatabaseStmt, sql string) {
 	log.Debug("checkCreateDB")
 
-	if s.checkDBExists(node.Name, false) {
+	if s.checkDBExists(node.Name.O, false) {
 		if !node.IfNotExists {
-			s.appendErrorMsg(fmt.Sprintf("数据库'%s'已存在.", node.Name))
+			s.appendErrorMsg(fmt.Sprintf("数据库'%s'已存在.", node.Name.O))
 		}
 	} else {
-		s.checkKeyWords(node.Name)
+		s.checkKeyWords(node.Name.O)
 
 		for _, opt := range node.Options {
 			switch opt.Tp {
@@ -7115,8 +7134,8 @@ func (s *session) checkCreateDB(node *ast.CreateDatabaseStmt, sql string) {
 			return
 		}
 
-		s.dbCacheList[strings.ToLower(node.Name)] = &DBInfo{
-			Name:      node.Name,
+		s.dbCacheList[strings.ToLower(node.Name.O)] = &DBInfo{
+			Name:      node.Name.O,
 			IsNew:     true,
 			IsDeleted: false,
 		}
@@ -7130,7 +7149,7 @@ func (s *session) checkCreateDB(node *ast.CreateDatabaseStmt, sql string) {
 func (s *session) checkAlterDB(node *ast.AlterDatabaseStmt, sql string) {
 	log.Debug("checkAlterDB")
 
-	if s.checkDBExists(node.Name, true) {
+	if s.checkDBExists(node.Name.O, true) {
 		if !s.inc.EnableAlterDatabase {
 			s.appendErrorNo(ER_NOT_SUPPORTED_YET)
 			return
@@ -7732,7 +7751,7 @@ func (s *session) checkColumnTypeImplicitConversion(e *ast.BinaryOperationExpr, 
 	log.Debug("checkColumnTypeImplicitConversion")
 
 	col, ok1 := e.L.(*ast.ColumnNameExpr)
-	val, ok2 := e.R.(*ast.ValueExpr)
+	val, ok2 := e.R.(*driver.ValueExpr)
 	// && val != nil 可以判断非空列的is null逻辑
 
 	if ok1 && ok2 && val != nil {
@@ -7771,9 +7790,9 @@ func (s *session) checkItem(expr ast.ExprNode, tables []*TableInfo) bool {
 	switch e := expr.(type) {
 	case *ast.ColumnNameExpr:
 		s.checkFieldItem(e.Name, tables)
-		if e.Refer != nil {
-			s.checkItem(e.Refer.Expr, tables)
-		}
+		// e.Refer used to expose the resolved expression, but the upstream
+		// parser dropped ResultField.Expr and no goInception code populated it,
+		// so there is nothing left to recurse into here.
 
 	case *ast.BinaryOperationExpr:
 		if s.inc.CheckImplicitTypeConversion {
@@ -7802,7 +7821,7 @@ func (s *session) checkItem(expr ast.ExprNode, tables []*TableInfo) bool {
 		if e.Sel != nil {
 			s.checkItem(e.Sel, tables)
 		}
-	case *ast.PatternLikeExpr:
+	case *ast.PatternLikeOrIlikeExpr:
 		s.checkItem(e.Expr, tables)
 	case *ast.PatternRegexpExpr:
 		s.checkItem(e.Expr, tables)
@@ -7815,7 +7834,9 @@ func (s *session) checkItem(expr ast.ExprNode, tables []*TableInfo) bool {
 		s.checkItem(e.R, tables)
 
 	case *ast.ExistsSubqueryExpr:
-		s.checkSelectItem(e.Sel, tables, false)
+		if subquery, ok := e.Sel.(ast.ResultSetNode); ok {
+			s.checkSelectItem(subquery, tables, false)
+		}
 
 	case *ast.IsNullExpr:
 		s.checkItem(e.Expr, tables)
@@ -7853,7 +7874,7 @@ func (s *session) checkItem(expr ast.ExprNode, tables []*TableInfo) bool {
 	case *ast.VariableExpr:
 		s.checkItem(e.Value, tables)
 
-	case *ast.ValueExpr, *ast.ParamMarkerExpr, *ast.PositionExpr:
+	case *driver.ValueExpr, *driver.ParamMarkerExpr, *ast.PositionExpr:
 		// pass
 
 	default:
@@ -8423,9 +8444,11 @@ func extractTableList(node ast.ResultSetNode, input []*ast.TableSource) []*ast.T
 		if x.From != nil {
 			input = extractTableList(x.From.TableRefs, input)
 		}
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		for _, sel := range x.SelectList.Selects {
-			input = extractTableList(sel, input)
+			if resultSet, ok := sel.(ast.ResultSetNode); ok {
+				input = extractTableList(resultSet, input)
+			}
 		}
 	default:
 		log.Infof("%T", x)
@@ -8520,7 +8543,7 @@ func (s *session) buildNewColumnToCache(t *TableInfo, field *ast.ColumnDef) *Fie
 	for _, op := range field.Options {
 		switch op.Tp {
 		case ast.ColumnOptionComment:
-			c.Comment = op.Expr.GetDatum().GetString()
+			c.Comment = exprDatum(op.Expr).GetString()
 		case ast.ColumnOptionNull:
 			c.Null = "YES"
 
@@ -8541,8 +8564,8 @@ func (s *session) buildNewColumnToCache(t *TableInfo, field *ast.ColumnDef) *Fie
 			case *ast.FuncCallExpr:
 				c.Default = new(string)
 				*c.Default = v.FnName.L
-			case *ast.ValueExpr:
-				if v.GetValue() == nil {
+			case *driver.ValueExpr:
+				if exprValue(v) == nil {
 					c.Null = "YES"
 					c.Default = nil
 				} else {
@@ -8614,19 +8637,30 @@ func (s *session) checkSelectItem(node ast.ResultSetNode,
 	}
 
 	switch x := node.(type) {
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		stmt := x.SelectList
 		for _, sel := range stmt.Selects[:len(stmt.Selects)-1] {
-			if sel.Limit != nil {
+			// The upstream parser types the operands as ast.Node.
+			var limit *ast.Limit
+			var orderBy *ast.OrderByClause
+			switch v := sel.(type) {
+			case *ast.SelectStmt:
+				limit, orderBy = v.Limit, v.OrderBy
+			case *ast.SetOprStmt:
+				limit, orderBy = v.Limit, v.OrderBy
+			}
+			if limit != nil {
 				s.appendErrorNo(ErrWrongUsage, "UNION", "LIMIT")
 			}
-			if sel.OrderBy != nil {
+			if orderBy != nil {
 				s.appendErrorNo(ErrWrongUsage, "UNION", "ORDER BY")
 			}
 		}
 
 		for _, sel := range stmt.Selects {
-			s.checkSubSelectItem(sel, outerTables)
+			if selectStmt, ok := sel.(*ast.SelectStmt); ok {
+				s.checkSubSelectItem(selectStmt, outerTables)
+			}
 		}
 
 	case *ast.SelectStmt:
@@ -8674,7 +8708,7 @@ func (s *session) checkSelectItem(node ast.ResultSetNode,
 				return []*TableInfo{t}
 			}
 
-		case *ast.UnionStmt:
+		case *ast.SetOprStmt:
 			s.checkSelectItem(tblSource, nil, false)
 
 			cols := s.getSubSelectColumns(tblSource)
@@ -8978,7 +9012,7 @@ func (s *session) cleanup() {
 func (s *session) checkSetStmt(node *ast.SetStmt) {
 	for _, variable := range node.Variables {
 		if variable.Name == ast.SetNames {
-			if value, ok := variable.Value.(*ast.ValueExpr); ok {
+			if value, ok := variable.Value.(*driver.ValueExpr); ok {
 				v := value.GetString()
 				if strings.EqualFold(v, "utf8") || strings.EqualFold(v, "utf8mb4") {
 					continue
@@ -9011,8 +9045,8 @@ func (s *session) checkVaildWhere(expr ast.ExprNode) bool {
 	case nil:
 	case *ast.BinaryOperationExpr:
 		if x.L != nil && x.R != nil {
-			_, ok1 := x.L.(*ast.ValueExpr)
-			_, ok2 := x.R.(*ast.ValueExpr)
+			_, ok1 := x.L.(*driver.ValueExpr)
+			_, ok2 := x.R.(*driver.ValueExpr)
 			if !ok1 || !ok2 {
 				return true
 			}
@@ -9027,7 +9061,7 @@ func (s *session) checkVaildWhere(expr ast.ExprNode) bool {
 		}
 	case *ast.ParenthesesExpr:
 		return s.checkVaildWhere(x.Expr)
-	case *ast.ValueExpr:
+	case *driver.ValueExpr:
 		return false
 	default:
 		return true
@@ -9085,4 +9119,34 @@ func (s *session) initDisableTypes() {
 
 func (s *session) InitDisableTypes() {
 	s.initDisableTypes()
+}
+
+// The upstream parser no longer exposes GetValue/GetDatum on ExprNode, so
+// literal nodes have to be asserted to the driver type first. Non-literal
+// expressions yield the zero datum, matching the old embedded-datum behaviour.
+var zeroDatum types.Datum
+
+func exprValue(expr ast.ExprNode) interface{} {
+	if v, ok := expr.(*driver.ValueExpr); ok {
+		return exprValue(v)
+	}
+	return nil
+}
+
+func exprDatum(expr ast.ExprNode) *types.Datum {
+	if v, ok := expr.(*driver.ValueExpr); ok {
+		return exprDatum(v)
+	}
+	return &zeroDatum
+}
+
+// setOprFirstSelect returns the first operand of a set operation as a
+// ResultSetNode. The upstream parser types the operands as ast.Node, which
+// does not carry the unexported resultSet marker method.
+func setOprFirstSelect(u *ast.SetOprStmt) (ast.ResultSetNode, bool) {
+	if u == nil || u.SelectList == nil || len(u.SelectList.Selects) == 0 {
+		return nil, false
+	}
+	rs, ok := u.SelectList.Selects[0].(ast.ResultSetNode)
+	return rs, ok
 }

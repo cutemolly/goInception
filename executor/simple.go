@@ -344,9 +344,12 @@ func (e *SimpleExec) executeFlush(s *ast.FlushStmt) error {
 
 func (e *SimpleExec) executeDropStats(s *ast.DropStatsStmt) error {
 	h := domain.GetDomain(e.ctx).StatsHandle()
-	err := h.DeleteTableStatsFromKV(s.Table.TableInfo.ID)
-	if err != nil {
-		return errors.Trace(err)
+	// The upstream parser replaced the single Table field with a list.
+	for _, tbl := range s.Tables {
+		err := h.DeleteTableStatsFromKV(tbl.TableInfo.ID)
+		if err != nil {
+			return errors.Trace(err)
+		}
 	}
 	return errors.Trace(h.Update(GetInfoSchema(e.ctx)))
 }

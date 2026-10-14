@@ -14,40 +14,48 @@
 package ast
 
 import (
-	"strconv"
+	"fmt"
 	"strings"
 
+	"github.com/pingcap/errors"
+	"github.com/hanchuanchuan/goInception/util/auth"
 	"github.com/hanchuanchuan/goInception/format"
-	. "github.com/hanchuanchuan/goInception/format"
 	"github.com/hanchuanchuan/goInception/model"
 	"github.com/hanchuanchuan/goInception/mysql"
 	"github.com/hanchuanchuan/goInception/terror"
+	"github.com/hanchuanchuan/goInception/parser/tidb"
 	"github.com/hanchuanchuan/goInception/types"
-	"github.com/hanchuanchuan/goInception/util/auth"
-	"github.com/pingcap/errors"
 )
 
 var (
 	_ DDLNode = &AlterTableStmt{}
-	_ DDLNode = &AlterTableGroupStmt{}
+	_ DDLNode = &AlterSequenceStmt{}
+	_ DDLNode = &AlterPlacementPolicyStmt{}
+	_ DDLNode = &AlterResourceGroupStmt{}
 	_ DDLNode = &CreateDatabaseStmt{}
 	_ DDLNode = &CreateIndexStmt{}
 	_ DDLNode = &CreateTableStmt{}
-	_ DDLNode = &CreateTableGroupStmt{}
 	_ DDLNode = &CreateViewStmt{}
+	_ DDLNode = &CreateSequenceStmt{}
+	_ DDLNode = &CreatePlacementPolicyStmt{}
+	_ DDLNode = &CreateResourceGroupStmt{}
 	_ DDLNode = &DropDatabaseStmt{}
+	_ DDLNode = &FlashBackDatabaseStmt{}
 	_ DDLNode = &DropIndexStmt{}
 	_ DDLNode = &DropTableStmt{}
-	_ DDLNode = &DropTableGroupStmt{}
+	_ DDLNode = &DropSequenceStmt{}
+	_ DDLNode = &DropPlacementPolicyStmt{}
+	_ DDLNode = &DropResourceGroupStmt{}
 	_ DDLNode = &RenameTableStmt{}
 	_ DDLNode = &TruncateTableStmt{}
+	_ DDLNode = &RepairTableStmt{}
 
 	_ Node = &AlterTableSpec{}
 	_ Node = &ColumnDef{}
 	_ Node = &ColumnOption{}
 	_ Node = &ColumnPosition{}
 	_ Node = &Constraint{}
-	_ Node = &IndexColName{}
+	_ Node = &IndexPartSpecification{}
 	_ Node = &ReferenceDef{}
 )
 
@@ -55,6 +63,12 @@ var (
 type CharsetOpt struct {
 	Chs string
 	Col string
+}
+
+// NullString represents a string that may be nil.
+type NullString struct {
+	String string
+	Empty  bool // Empty is true if String is empty backtick.
 }
 
 // DatabaseOptionType is the type for database options.
@@ -65,16 +79,21 @@ const (
 	DatabaseOptionNone DatabaseOptionType = iota
 	DatabaseOptionCharset
 	DatabaseOptionCollate
+	DatabaseOptionEncryption
+	DatabaseSetTiFlashReplica
+	DatabaseOptionPlacementPolicy = DatabaseOptionType(PlacementOptionPolicy)
 )
 
 // DatabaseOption represents database option.
 type DatabaseOption struct {
-	Tp    DatabaseOptionType
-	Value string
+	Tp             DatabaseOptionType
+	Value          string
+	UintValue      uint64
+	TiFlashReplica *TiFlashReplicaSpec
 }
 
 // Restore implements Node interface.
-func (n *DatabaseOption) Restore(ctx *RestoreCtx) error {
+func (n *DatabaseOption) Restore(ctx *format.RestoreCtx) error {
 	switch n.Tp {
 	case DatabaseOptionCharset:
 		ctx.WriteKeyWord("CHARACTER SET")
@@ -84,6 +103,30 @@ func (n *DatabaseOption) Restore(ctx *RestoreCtx) error {
 		ctx.WriteKeyWord("COLLATE")
 		ctx.WritePlain(" = ")
 		ctx.WritePlain(n.Value)
+	case DatabaseOptionEncryption:
+		ctx.WriteKeyWord("ENCRYPTION")
+		ctx.WritePlain(" = ")
+		ctx.WriteString(n.Value)
+	case DatabaseOptionPlacementPolicy:
+		placementOpt := PlacementOption{
+			Tp:        PlacementOptionPolicy,
+			UintValue: n.UintValue,
+			StrValue:  n.Value,
+		}
+		return placementOpt.Restore(ctx)
+	case DatabaseSetTiFlashReplica:
+		ctx.WriteKeyWord("SET TIFLASH REPLICA ")
+		ctx.WritePlainf("%d", n.TiFlashReplica.Count)
+		if len(n.TiFlashReplica.Labels) == 0 {
+			break
+		}
+		ctx.WriteKeyWord(" LOCATION LABELS ")
+		for i, v := range n.TiFlashReplica.Labels {
+			if i > 0 {
+				ctx.WritePlain(", ")
+			}
+			ctx.WriteString(v)
+		}
 	default:
 		return errors.Errorf("invalid DatabaseOptionType: %d", n.Tp)
 	}
@@ -96,17 +139,17 @@ type CreateDatabaseStmt struct {
 	ddlNode
 
 	IfNotExists bool
-	Name        string
+	Name        model.CIStr
 	Options     []*DatabaseOption
 }
 
 // Restore implements Node interface.
-func (n *CreateDatabaseStmt) Restore(ctx *RestoreCtx) error {
+func (n *CreateDatabaseStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("CREATE DATABASE ")
 	if n.IfNotExists {
 		ctx.WriteKeyWord("IF NOT EXISTS ")
 	}
-	ctx.WriteName(n.Name)
+	ctx.WriteName(n.Name.O)
 	for i, option := range n.Options {
 		ctx.WritePlain(" ")
 		err := option.Restore(ctx)
@@ -132,17 +175,30 @@ func (n *CreateDatabaseStmt) Accept(v Visitor) (Node, bool) {
 type AlterDatabaseStmt struct {
 	ddlNode
 
-	Name                 string
+	Name                 model.CIStr
 	AlterDefaultDatabase bool
 	Options              []*DatabaseOption
 }
 
 // Restore implements Node interface.
-func (n *AlterDatabaseStmt) Restore(ctx *RestoreCtx) error {
+func (n *AlterDatabaseStmt) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasSkipPlacementRuleForRestoreFlag() && n.isAllPlacementOptions() {
+		return nil
+	}
+	// If all options placement options and RestoreTiDBSpecialComment flag is on,
+	// we should restore the whole node in special comment. For example, the restore result should be:
+	// /*T![placement] ALTER DATABASE `db1` PLACEMENT POLICY = `p1` */
+	// instead of
+	// ALTER DATABASE `db1` /*T![placement] PLACEMENT POLICY = `p1` */
+	// because altering a database without any options is not a legal syntax in mysql
+	if n.isAllPlacementOptions() && ctx.Flags.HasTiDBSpecialCommentFlag() {
+		return restorePlacementStmtInSpecialComment(ctx, n)
+	}
+
 	ctx.WriteKeyWord("ALTER DATABASE")
 	if !n.AlterDefaultDatabase {
 		ctx.WritePlain(" ")
-		ctx.WriteName(n.Name)
+		ctx.WriteName(n.Name.O)
 	}
 	for i, option := range n.Options {
 		ctx.WritePlain(" ")
@@ -164,22 +220,33 @@ func (n *AlterDatabaseStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+func (n *AlterDatabaseStmt) isAllPlacementOptions() bool {
+	for _, n := range n.Options {
+		switch n.Tp {
+		case DatabaseOptionPlacementPolicy:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // DropDatabaseStmt is a statement to drop a database and all tables in the database.
 // See https://dev.mysql.com/doc/refman/5.7/en/drop-database.html
 type DropDatabaseStmt struct {
 	ddlNode
 
 	IfExists bool
-	Name     string
+	Name     model.CIStr
 }
 
 // Restore implements Node interface.
-func (n *DropDatabaseStmt) Restore(ctx *RestoreCtx) error {
+func (n *DropDatabaseStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("DROP DATABASE ")
 	if n.IfExists {
 		ctx.WriteKeyWord("IF EXISTS ")
 	}
-	ctx.WriteName(n.Name)
+	ctx.WriteName(n.Name.O)
 	return nil
 }
 
@@ -193,32 +260,86 @@ func (n *DropDatabaseStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// IndexColName is used for parsing index column name from SQL.
-type IndexColName struct {
-	node
+// FlashBackDatabaseStmt is a statement to restore a database and all tables in the database.
+type FlashBackDatabaseStmt struct {
+	ddlNode
 
-	Column *ColumnName
-	Length int
+	DBName  model.CIStr
+	NewName string
 }
 
 // Restore implements Node interface.
-func (n *IndexColName) Restore(ctx *RestoreCtx) error {
-	if err := n.Column.Restore(ctx); err != nil {
-		return errors.Annotate(err, "An error occurred while splicing IndexColName")
-	}
-	if n.Length > 0 {
-		ctx.WritePlainf("(%d)", n.Length)
+func (n *FlashBackDatabaseStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("FLASHBACK DATABASE ")
+	ctx.WriteName(n.DBName.O)
+	if len(n.NewName) > 0 {
+		ctx.WriteKeyWord(" TO ")
+		ctx.WriteName(n.NewName)
 	}
 	return nil
 }
 
 // Accept implements Node Accept interface.
-func (n *IndexColName) Accept(v Visitor) (Node, bool) {
+func (n *FlashBackDatabaseStmt) Accept(v Visitor) (Node, bool) {
 	newNode, skipChildren := v.Enter(n)
 	if skipChildren {
 		return v.Leave(newNode)
 	}
-	n = newNode.(*IndexColName)
+	n = newNode.(*FlashBackDatabaseStmt)
+	return v.Leave(n)
+}
+
+// IndexPartSpecifications is used for parsing index column name or index expression from SQL.
+type IndexPartSpecification struct {
+	node
+
+	Column *ColumnName
+	Length int
+	// Order is parsed but should be ignored because MySQL v5.7 doesn't support it.
+	Desc bool
+	Expr ExprNode
+}
+
+// Restore implements Node interface.
+func (n *IndexPartSpecification) Restore(ctx *format.RestoreCtx) error {
+	if n.Expr != nil {
+		ctx.WritePlain("(")
+		if err := n.Expr.Restore(ctx); err != nil {
+			return errors.Annotate(err, "An error occurred while splicing IndexPartSpecifications")
+		}
+		ctx.WritePlain(")")
+		if n.Desc {
+			ctx.WritePlain(" DESC")
+		}
+		return nil
+	}
+	if err := n.Column.Restore(ctx); err != nil {
+		return errors.Annotate(err, "An error occurred while splicing IndexPartSpecifications")
+	}
+	if n.Length > 0 {
+		ctx.WritePlainf("(%d)", n.Length)
+	}
+	if n.Desc {
+		ctx.WritePlain(" DESC")
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *IndexPartSpecification) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*IndexPartSpecification)
+	if n.Expr != nil {
+		node, ok := n.Expr.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Expr = node.(ExprNode)
+		return v.Leave(n)
+	}
 	node, ok := n.Column.Accept(v)
 	if !ok {
 		return n, false
@@ -227,42 +348,69 @@ func (n *IndexColName) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// MatchType is the type for reference match type.
+type MatchType int
+
+// match type
+const (
+	MatchNone MatchType = iota
+	MatchFull
+	MatchPartial
+	MatchSimple
+)
+
 // ReferenceDef is used for parsing foreign key reference option from SQL.
 // See http://dev.mysql.com/doc/refman/5.7/en/create-table-foreign-keys.html
 type ReferenceDef struct {
 	node
 
-	Table         *TableName
-	IndexColNames []*IndexColName
-	OnDelete      *OnDeleteOpt
-	OnUpdate      *OnUpdateOpt
+	Table                   *TableName
+	IndexPartSpecifications []*IndexPartSpecification
+	OnDelete                *OnDeleteOpt
+	OnUpdate                *OnUpdateOpt
+	Match                   MatchType
 }
 
 // Restore implements Node interface.
-func (n *ReferenceDef) Restore(ctx *RestoreCtx) error {
+func (n *ReferenceDef) Restore(ctx *format.RestoreCtx) error {
 	if n.Table != nil {
 		ctx.WriteKeyWord("REFERENCES ")
 		if err := n.Table.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing ReferenceDef")
 		}
 	}
-	ctx.WritePlain("(")
-	for i, indexColNames := range n.IndexColNames {
-		if i > 0 {
-			ctx.WritePlain(", ")
+
+	if n.IndexPartSpecifications != nil {
+		ctx.WritePlain("(")
+		for i, indexColNames := range n.IndexPartSpecifications {
+			if i > 0 {
+				ctx.WritePlain(", ")
+			}
+			if err := indexColNames.Restore(ctx); err != nil {
+				return errors.Annotatef(err, "An error occurred while splicing IndexPartSpecifications: [%v]", i)
+			}
 		}
-		if err := indexColNames.Restore(ctx); err != nil {
-			return errors.Annotatef(err, "An error occurred while splicing IndexColNames: [%v]", i)
+		ctx.WritePlain(")")
+	}
+
+	if n.Match != MatchNone {
+		ctx.WriteKeyWord(" MATCH ")
+		switch n.Match {
+		case MatchFull:
+			ctx.WriteKeyWord("FULL")
+		case MatchPartial:
+			ctx.WriteKeyWord("PARTIAL")
+		case MatchSimple:
+			ctx.WriteKeyWord("SIMPLE")
 		}
 	}
-	ctx.WritePlain(")")
-	if n.OnDelete.ReferOpt != ReferOptionNoOption {
+	if n.OnDelete.ReferOpt != model.ReferOptionNoOption {
 		ctx.WritePlain(" ")
 		if err := n.OnDelete.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing OnDelete")
 		}
 	}
-	if n.OnUpdate.ReferOpt != ReferOptionNoOption {
+	if n.OnUpdate.ReferOpt != model.ReferOptionNoOption {
 		ctx.WritePlain(" ")
 		if err := n.OnUpdate.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing OnUpdate")
@@ -278,17 +426,19 @@ func (n *ReferenceDef) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*ReferenceDef)
-	node, ok := n.Table.Accept(v)
-	if !ok {
-		return n, false
-	}
-	n.Table = node.(*TableName)
-	for i, val := range n.IndexColNames {
-		node, ok = val.Accept(v)
+	if n.Table != nil {
+		node, ok := n.Table.Accept(v)
 		if !ok {
 			return n, false
 		}
-		n.IndexColNames[i] = node.(*IndexColName)
+		n.Table = node.(*TableName)
+	}
+	for i, val := range n.IndexPartSpecifications {
+		node, ok := val.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.IndexPartSpecifications[i] = node.(*IndexPartSpecification)
 	}
 	onDelete, ok := n.OnDelete.Accept(v)
 	if !ok {
@@ -303,45 +453,15 @@ func (n *ReferenceDef) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// ReferOptionType is the type for refer options.
-type ReferOptionType int
-
-// Refer option types.
-const (
-	ReferOptionNoOption ReferOptionType = iota
-	ReferOptionRestrict
-	ReferOptionCascade
-	ReferOptionSetNull
-	ReferOptionNoAction
-	ReferOptionSetDefault
-)
-
-// String implements fmt.Stringer interface.
-func (r ReferOptionType) String() string {
-	switch r {
-	case ReferOptionRestrict:
-		return "RESTRICT"
-	case ReferOptionCascade:
-		return "CASCADE"
-	case ReferOptionSetNull:
-		return "SET NULL"
-	case ReferOptionNoAction:
-		return "NO ACTION"
-	case ReferOptionSetDefault:
-		return "SET DEFAULT"
-	}
-	return ""
-}
-
 // OnDeleteOpt is used for optional on delete clause.
 type OnDeleteOpt struct {
 	node
-	ReferOpt ReferOptionType
+	ReferOpt model.ReferOptionType
 }
 
 // Restore implements Node interface.
-func (n *OnDeleteOpt) Restore(ctx *RestoreCtx) error {
-	if n.ReferOpt != ReferOptionNoOption {
+func (n *OnDeleteOpt) Restore(ctx *format.RestoreCtx) error {
+	if n.ReferOpt != model.ReferOptionNoOption {
 		ctx.WriteKeyWord("ON DELETE ")
 		ctx.WriteKeyWord(n.ReferOpt.String())
 	}
@@ -361,12 +481,12 @@ func (n *OnDeleteOpt) Accept(v Visitor) (Node, bool) {
 // OnUpdateOpt is used for optional on update clause.
 type OnUpdateOpt struct {
 	node
-	ReferOpt ReferOptionType
+	ReferOpt model.ReferOptionType
 }
 
 // Restore implements Node interface.
-func (n *OnUpdateOpt) Restore(ctx *RestoreCtx) error {
-	if n.ReferOpt != ReferOptionNoOption {
+func (n *OnUpdateOpt) Restore(ctx *format.RestoreCtx) error {
+	if n.ReferOpt != model.ReferOptionNoOption {
 		ctx.WriteKeyWord("ON UPDATE ")
 		ctx.WriteKeyWord(n.ReferOpt.String())
 	}
@@ -408,10 +528,10 @@ const (
 )
 
 var (
-	invalidOptionForGeneratedColumn = map[ColumnOptionType]struct{}{
-		ColumnOptionAutoIncrement: {},
-		ColumnOptionOnUpdate:      {},
-		ColumnOptionDefaultValue:  {},
+	invalidOptionForGeneratedColumn = map[ColumnOptionType]string{
+		ColumnOptionAutoIncrement: "AUTO_INCREMENT",
+		ColumnOptionOnUpdate:      "ON UPDATE",
+		ColumnOptionDefaultValue:  "DEFAULT",
 	}
 )
 
@@ -427,18 +547,31 @@ type ColumnOption struct {
 	// Stored is only for ColumnOptionGenerated, default is false.
 	Stored bool
 	// Refer is used for foreign key.
-	Refer               *ReferenceDef
-	StrValue            string
-	AutoRandomBitLength int
+	Refer       *ReferenceDef
+	StrValue    string
+	AutoRandOpt AutoRandomOption
+	// Enforced is only for Check, default is true.
+	Enforced bool
+	// Name is only used for Check Constraint name.
+	ConstraintName string
+	PrimaryKeyTp   model.PrimaryKeyType
 }
 
 // Restore implements Node interface.
-func (n *ColumnOption) Restore(ctx *RestoreCtx) error {
+func (n *ColumnOption) Restore(ctx *format.RestoreCtx) error {
 	switch n.Tp {
 	case ColumnOptionNoOption:
 		return nil
 	case ColumnOptionPrimaryKey:
 		ctx.WriteKeyWord("PRIMARY KEY")
+		pkTp := n.PrimaryKeyTp.String()
+		if len(pkTp) != 0 {
+			ctx.WritePlain(" ")
+			_ = ctx.WriteWithSpecialComments(tidb.FeatureIDClusteredIndex, func() error {
+				ctx.WriteKeyWord(pkTp)
+				return nil
+			})
+		}
 	case ColumnOptionNotNull:
 		ctx.WriteKeyWord("NOT NULL")
 	case ColumnOptionAutoIncrement:
@@ -486,14 +619,42 @@ func (n *ColumnOption) Restore(ctx *RestoreCtx) error {
 		}
 		ctx.WriteKeyWord("COLLATE ")
 		ctx.WritePlain(n.StrValue)
+	case ColumnOptionCheck:
+		if n.ConstraintName != "" {
+			ctx.WriteKeyWord("CONSTRAINT ")
+			ctx.WriteName(n.ConstraintName)
+			ctx.WritePlain(" ")
+		}
+		ctx.WriteKeyWord("CHECK")
+		ctx.WritePlain("(")
+		if err := n.Expr.Restore(ctx); err != nil {
+			return errors.Trace(err)
+		}
+		ctx.WritePlain(")")
+		if n.Enforced {
+			ctx.WriteKeyWord(" ENFORCED")
+		} else {
+			ctx.WriteKeyWord(" NOT ENFORCED")
+		}
+	case ColumnOptionColumnFormat:
+		ctx.WriteKeyWord("COLUMN_FORMAT ")
+		ctx.WriteKeyWord(n.StrValue)
 	case ColumnOptionStorage:
 		ctx.WriteKeyWord("STORAGE ")
 		ctx.WriteKeyWord(n.StrValue)
 	case ColumnOptionAutoRandom:
-		ctx.WriteKeyWord("AUTO_RANDOM")
-		if n.AutoRandomBitLength != types.UnspecifiedLength {
-			ctx.WritePlainf("(%d)", n.AutoRandomBitLength)
-		}
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDAutoRandom, func() error {
+			ctx.WriteKeyWord("AUTO_RANDOM")
+			opt := n.AutoRandOpt
+			if opt.ShardBits != types.UnspecifiedLength {
+				if opt.RangeBits != types.UnspecifiedLength {
+					ctx.WritePlainf("(%d, %d)", opt.ShardBits, opt.RangeBits)
+				} else {
+					ctx.WritePlainf("(%d)", opt.ShardBits)
+				}
+			}
+			return nil
+		})
 	default:
 		return errors.New("An error occurred while splicing ColumnOption")
 	}
@@ -517,6 +678,14 @@ func (n *ColumnOption) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// AutoRandomOption contains the length of shard bits and range bits.
+type AutoRandomOption struct {
+	// ShardBits is the number of bits used to store the shard.
+	ShardBits int
+	// RangeBits is the number of int primary key bits that will be used by TiDB.
+	RangeBits int
+}
+
 // IndexVisibility is the option for index visibility.
 type IndexVisibility int
 
@@ -538,24 +707,27 @@ const (
 type IndexOption struct {
 	node
 
-	// PartitionIndexType OceanBase:[GLOBAL|LOCAL]
-	PartitionIndexType model.PartitionIndexType
-
 	KeyBlockSize uint64
 	Tp           model.IndexType
 	Comment      string
 	ParserName   model.CIStr
 	Visibility   IndexVisibility
+	PrimaryKeyTp model.PrimaryKeyType
+	// PartitionIndexType is a goInception extension for OceanBase
+	// [GLOBAL|LOCAL] partition index syntax.
+	PartitionIndexType model.PartitionIndexType
 }
 
 // Restore implements Node interface.
-func (n *IndexOption) Restore(ctx *RestoreCtx) error {
+func (n *IndexOption) Restore(ctx *format.RestoreCtx) error {
 	hasPrevOption := false
-	if n.PartitionIndexType != model.PartitionIndexTypeInvalid {
-		ctx.WritePlain(n.PartitionIndexType.String())
+	if n.PrimaryKeyTp != model.PrimaryKeyTypeDefault {
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDClusteredIndex, func() error {
+			ctx.WriteKeyWord(n.PrimaryKeyTp.String())
+			return nil
+		})
 		hasPrevOption = true
 	}
-
 	if n.KeyBlockSize > 0 {
 		if hasPrevOption {
 			ctx.WritePlain(" ")
@@ -631,6 +803,7 @@ const (
 	ConstraintForeignKey
 	ConstraintFulltext
 	ConstraintCheck
+	// ConstraintSpatial is a goInception extension for SPATIAL KEY constraints.
 	ConstraintSpatial
 )
 
@@ -645,18 +818,24 @@ type Constraint struct {
 	Tp   ConstraintType
 	Name string
 
-	Keys []*IndexColName // Used for PRIMARY KEY, UNIQUE, ......
+	Keys []*IndexPartSpecification // Used for PRIMARY KEY, UNIQUE, ......
 
 	Refer *ReferenceDef // Used for foreign key.
 
 	Option *IndexOption // Index Options
-	Expr   ExprNode     // Used for Check
+
+	Expr ExprNode // Used for Check
 
 	Enforced bool // Used for Check
+
+	InColumn bool // Used for Check
+
+	InColumnName string // Used for Check
+	IsEmptyIndex bool   // Used for Check
 }
 
 // Restore implements Node interface.
-func (n *Constraint) Restore(ctx *RestoreCtx) error {
+func (n *Constraint) Restore(ctx *format.RestoreCtx) error {
 	switch n.Tp {
 	case ConstraintNoConstraint:
 		return nil
@@ -664,8 +843,14 @@ func (n *Constraint) Restore(ctx *RestoreCtx) error {
 		ctx.WriteKeyWord("PRIMARY KEY")
 	case ConstraintKey:
 		ctx.WriteKeyWord("KEY")
+		if n.IfNotExists {
+			ctx.WriteKeyWord(" IF NOT EXISTS")
+		}
 	case ConstraintIndex:
 		ctx.WriteKeyWord("INDEX")
+		if n.IfNotExists {
+			ctx.WriteKeyWord(" IF NOT EXISTS")
+		}
 	case ConstraintUniq:
 		ctx.WriteKeyWord("UNIQUE")
 	case ConstraintUniqKey:
@@ -674,6 +859,24 @@ func (n *Constraint) Restore(ctx *RestoreCtx) error {
 		ctx.WriteKeyWord("UNIQUE INDEX")
 	case ConstraintFulltext:
 		ctx.WriteKeyWord("FULLTEXT")
+	case ConstraintCheck:
+		if n.Name != "" {
+			ctx.WriteKeyWord("CONSTRAINT ")
+			ctx.WriteName(n.Name)
+			ctx.WritePlain(" ")
+		}
+		ctx.WriteKeyWord("CHECK")
+		ctx.WritePlain("(")
+		if err := n.Expr.Restore(ctx); err != nil {
+			return errors.Trace(err)
+		}
+		ctx.WritePlain(") ")
+		if n.Enforced {
+			ctx.WriteKeyWord("ENFORCED")
+		} else {
+			ctx.WriteKeyWord("NOT ENFORCED")
+		}
+		return nil
 	}
 
 	if n.Tp == ConstraintForeignKey {
@@ -683,7 +886,10 @@ func (n *Constraint) Restore(ctx *RestoreCtx) error {
 			ctx.WritePlain(" ")
 		}
 		ctx.WriteKeyWord("FOREIGN KEY ")
-	} else if n.Name != "" {
+		if n.IfNotExists {
+			ctx.WriteKeyWord("IF NOT EXISTS ")
+		}
+	} else if n.Name != "" || n.IsEmptyIndex {
 		ctx.WritePlain(" ")
 		ctx.WriteName(n.Name)
 	}
@@ -706,7 +912,7 @@ func (n *Constraint) Restore(ctx *RestoreCtx) error {
 		}
 	}
 
-	if n.Option != nil && (n.Option.Tp != model.IndexTypeInvalid || n.Option.KeyBlockSize > 0 || n.Option.Comment != "" || len(n.Option.ParserName.O) > 0 || n.Option.Visibility != IndexVisibilityDefault) {
+	if n.Option != nil {
 		ctx.WritePlain(" ")
 		if err := n.Option.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing Constraint Option")
@@ -728,7 +934,7 @@ func (n *Constraint) Accept(v Visitor) (Node, bool) {
 		if !ok {
 			return n, false
 		}
-		n.Keys[i] = node.(*IndexColName)
+		n.Keys[i] = node.(*IndexPartSpecification)
 	}
 	if n.Refer != nil {
 		node, ok := n.Refer.Accept(v)
@@ -744,6 +950,13 @@ func (n *Constraint) Accept(v Visitor) (Node, bool) {
 		}
 		n.Option = node.(*IndexOption)
 	}
+	if n.Expr != nil {
+		node, ok := n.Expr.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Expr = node.(ExprNode)
+	}
 	return v.Leave(n)
 }
 
@@ -757,7 +970,7 @@ type ColumnDef struct {
 }
 
 // Restore implements Node interface.
-func (n *ColumnDef) Restore(ctx *RestoreCtx) error {
+func (n *ColumnDef) Restore(ctx *format.RestoreCtx) error {
 	if err := n.Name.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while splicing ColumnDef Name")
 	}
@@ -802,18 +1015,31 @@ func (n *ColumnDef) Accept(v Visitor) (Node, bool) {
 // For example, generated column definitions that contain such
 // column options as `ON UPDATE`, `AUTO_INCREMENT`, `DEFAULT`
 // are illegal.
-func (n *ColumnDef) Validate() bool {
+func (n *ColumnDef) Validate() error {
 	generatedCol := false
-	illegalOpt4gc := false
+	var illegalOpt4gc string
 	for _, opt := range n.Options {
 		if opt.Tp == ColumnOptionGenerated {
 			generatedCol = true
 		}
-		_, found := invalidOptionForGeneratedColumn[opt.Tp]
-		illegalOpt4gc = illegalOpt4gc || found
+		msg, found := invalidOptionForGeneratedColumn[opt.Tp]
+		if found {
+			illegalOpt4gc = msg
+		}
 	}
-	return !(generatedCol && illegalOpt4gc)
+	if generatedCol && illegalOpt4gc != "" {
+		return ErrWrongUsage.GenWithStackByArgs(illegalOpt4gc, "generated column")
+	}
+	return nil
 }
+
+type TemporaryKeyword int
+
+const (
+	TemporaryNone TemporaryKeyword = iota
+	TemporaryGlobal
+	TemporaryLocal
+)
 
 // CreateTableStmt is a statement to create a table.
 // See https://dev.mysql.com/doc/refman/5.7/en/create-table.html
@@ -821,20 +1047,31 @@ type CreateTableStmt struct {
 	ddlNode
 
 	IfNotExists bool
-	IsTemporary bool
-	Table       *TableName
-	ReferTable  *TableName
-	Cols        []*ColumnDef
-	Constraints []*Constraint
-	Options     []*TableOption
-	Partition   *PartitionOptions
-	OnDuplicate OnDuplicateKeyHandlingType
-	Select      ResultSetNode
+	TemporaryKeyword
+	// Meanless when TemporaryKeyword is not TemporaryGlobal.
+	// ON COMMIT DELETE ROWS => true
+	// ON COMMIT PRESERVE ROW => false
+	OnCommitDelete bool
+	Table          *TableName
+	ReferTable     *TableName
+	Cols           []*ColumnDef
+	Constraints    []*Constraint
+	Options        []*TableOption
+	Partition      *PartitionOptions
+	OnDuplicate    OnDuplicateKeyHandlingType
+	Select         ResultSetNode
 }
 
 // Restore implements Node interface.
-func (n *CreateTableStmt) Restore(ctx *RestoreCtx) error {
-	ctx.WriteKeyWord("CREATE TABLE ")
+func (n *CreateTableStmt) Restore(ctx *format.RestoreCtx) error {
+	switch n.TemporaryKeyword {
+	case TemporaryNone:
+		ctx.WriteKeyWord("CREATE TABLE ")
+	case TemporaryGlobal:
+		ctx.WriteKeyWord("CREATE GLOBAL TEMPORARY TABLE ")
+	case TemporaryLocal:
+		ctx.WriteKeyWord("CREATE TEMPORARY TABLE ")
+	}
 	if n.IfNotExists {
 		ctx.WriteKeyWord("IF NOT EXISTS ")
 	}
@@ -842,9 +1079,9 @@ func (n *CreateTableStmt) Restore(ctx *RestoreCtx) error {
 	if err := n.Table.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while splicing CreateTableStmt Table")
 	}
-	ctx.WritePlain(" ")
+
 	if n.ReferTable != nil {
-		ctx.WriteKeyWord("LIKE ")
+		ctx.WriteKeyWord(" LIKE ")
 		if err := n.ReferTable.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing CreateTableStmt ReferTable")
 		}
@@ -852,7 +1089,7 @@ func (n *CreateTableStmt) Restore(ctx *RestoreCtx) error {
 	lenCols := len(n.Cols)
 	lenConstraints := len(n.Constraints)
 	if lenCols+lenConstraints > 0 {
-		ctx.WritePlain("(")
+		ctx.WritePlain(" (")
 		for i, col := range n.Cols {
 			if i > 0 {
 				ctx.WritePlain(",")
@@ -872,7 +1109,8 @@ func (n *CreateTableStmt) Restore(ctx *RestoreCtx) error {
 		ctx.WritePlain(")")
 	}
 
-	for i, option := range n.Options {
+	options := tableOptionsWithRestoreTTLFlag(ctx.Flags, n.Options)
+	for i, option := range options {
 		ctx.WritePlain(" ")
 		if err := option.Restore(ctx); err != nil {
 			return errors.Annotatef(err, "An error occurred while splicing CreateTableStmt TableOption: [%v]", i)
@@ -898,6 +1136,14 @@ func (n *CreateTableStmt) Restore(ctx *RestoreCtx) error {
 
 		if err := n.Select.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing CreateTableStmt Select")
+		}
+	}
+
+	if n.TemporaryKeyword == TemporaryGlobal {
+		if n.OnCommitDelete {
+			ctx.WriteKeyWord(" ON COMMIT DELETE ROWS")
+		} else {
+			ctx.WriteKeyWord(" ON COMMIT PRESERVE ROWS")
 		}
 	}
 
@@ -951,221 +1197,14 @@ func (n *CreateTableStmt) Accept(v Visitor) (Node, bool) {
 		}
 		n.Partition = node.(*PartitionOptions)
 	}
-
-	return v.Leave(n)
-}
-
-// CreateTableGroupStmt is a statement to create a table group.
-type CreateTableGroupStmt struct {
-	ddlNode
-
-	IfNotExists bool
-	TableGroup  *TableGroupName
-	Options     []*TableGroupOption
-	Partition   *TableGroupPartitionOption
-}
-
-// Restore implements Node interface.
-func (n *CreateTableGroupStmt) Restore(ctx *RestoreCtx) error {
-	ctx.WriteKeyWord("CREATE TABLEGROUP ")
-	if n.IfNotExists {
-		ctx.WriteKeyWord("IF NOT EXISTS ")
-	}
-
-	if err := n.TableGroup.Restore(ctx); err != nil {
-		return errors.Annotate(err, "An error occurred while splicing CreateTableGroupStmt TableGroup")
-	}
-
 	for i, option := range n.Options {
-		ctx.WritePlain(" ")
-		if err := option.Restore(ctx); err != nil {
-			return errors.Annotatef(err, "An error occurred while splicing CreateTableGroupStmt TableGroupOption: [%v]", i)
-		}
-	}
-
-	if n.Partition != nil {
-		ctx.WritePlain(" ")
-		if err := n.Partition.Restore(ctx); err != nil {
-			return errors.Annotate(err, "An error occurred while splicing CreateTableGroupStmt Partition")
-		}
-	}
-	return nil
-}
-
-// Accept implements Node Accept interface.
-func (n *CreateTableGroupStmt) Accept(v Visitor) (Node, bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-
-	n = newNode.(*CreateTableGroupStmt)
-	node, ok := n.TableGroup.Accept(v)
-	if !ok {
-		return n, false
-	}
-
-	n.TableGroup = node.(*TableGroupName)
-	if n.Partition != nil {
-		node, ok := n.Partition.Accept(v)
+		node, ok = option.Accept(v)
 		if !ok {
 			return n, false
 		}
-		n.Partition = node.(*TableGroupPartitionOption)
+		n.Options[i] = node.(*TableOption)
 	}
 
-	return v.Leave(n)
-}
-
-// TableGroupOptionType is the type for TableGroupOption
-type TableGroupOptionType int
-
-// TableGroupOption types
-const (
-	TableGroupOptionNone TableGroupOptionType = iota
-	TableGroupOptionLocality
-	TableGroupOptionPrimaryZone
-	TableGroupOptionTableGroupId
-	TableGroupOptionBinding
-	TableGroupOptionMaxUsedPartId
-)
-
-// TableGroupOption is used for parsing table group option from SQL.
-type TableGroupOption struct {
-	node
-
-	Tp     TableGroupOptionType
-	String string
-	Num    uint64
-	Bool   bool
-}
-
-// Restore implements Node interface.
-func (n *TableGroupOption) Restore(ctx *RestoreCtx) error {
-	switch n.Tp {
-	case TableGroupOptionNone:
-		return nil
-	case TableGroupOptionLocality:
-		ctx.WriteKeyWord("LOCALITY ")
-		ctx.WriteString(n.String)
-		return nil
-	case TableGroupOptionPrimaryZone:
-		ctx.WriteKeyWord("PRIMARY_ZONE ")
-		ctx.WriteString(n.String)
-		return nil
-	case TableGroupOptionTableGroupId:
-		ctx.WriteKeyWord("TABLEGROUP_ID ")
-		ctx.WriteString(strconv.FormatUint(n.Num, 10))
-		return nil
-	case TableGroupOptionBinding:
-		ctx.WriteKeyWord("BINDING ")
-		ctx.WriteString(strconv.FormatBool(n.Bool))
-		return nil
-	case TableGroupOptionMaxUsedPartId:
-		ctx.WriteKeyWord("MAX_USED_PART_ID ")
-		ctx.WriteString(strconv.FormatUint(n.Num, 10))
-		return nil
-	default:
-		return errors.Errorf("invalid TableGroupOptionType: %d", n.Tp)
-	}
-}
-
-// Accept implements Node Accept interface.
-func (n *TableGroupOption) Accept(v Visitor) (Node, bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-	n = newNode.(*TableGroupOption)
-	return v.Leave(n)
-}
-
-// TableGroupPartitionOption specifies the table group partition options.
-type TableGroupPartitionOption struct {
-	node
-	*PartitionMethod
-	Sub         *PartitionMethod
-	Definitions []*PartitionDefinition
-}
-
-// Validate checks if the partition is well-formed.
-func (n *TableGroupPartitionOption) Validate() error {
-	if len(n.Definitions) != 0 {
-		if n.Num != 0 && n.Num != uint64(len(n.Definitions)) {
-			return ErrPartitionWrongNoPart
-		}
-		subDefCount := len(n.Definitions[0].Sub)
-		for _, subDef := range n.Definitions[1:] {
-			if len(subDef.Sub) != subDefCount {
-				return ErrPartitionWrongNoSubpart
-			}
-		}
-	}
-
-	switch n.Tp {
-	case model.PartitionTypeHash, model.PartitionTypeKey:
-		if n.Num == 0 {
-			n.Num = 1
-		}
-	case model.PartitionTypeRange, model.PartitionTypeList:
-		if len(n.Definitions) == 0 {
-			return ErrPartitionsMustBeDefined.GenWithStackByArgs(n.Tp)
-		}
-	}
-	return nil
-}
-
-// Restore implements Node interface.
-func (n *TableGroupPartitionOption) Restore(ctx *RestoreCtx) error {
-	ctx.WriteKeyWord("PARTITION BY " + n.PartitionMethod.Tp.String())
-
-	if n.Sub != nil {
-		ctx.WriteKeyWord(" SUBPARTITION BY " + n.Sub.Tp.String())
-		if n.Sub.Num > 0 {
-			ctx.WriteKeyWord(" SUBPARTITIONS ")
-			ctx.WritePlainf("%d", n.Sub.Num)
-		}
-	}
-
-	if n.Num > 0 {
-		ctx.WriteKeyWord(" PARTITIONS ")
-		ctx.WritePlainf("%d", n.Num)
-	}
-
-	if len(n.Definitions) > 0 {
-		ctx.WritePlain(" (")
-		for i, def := range n.Definitions {
-			if i > 0 {
-				ctx.WritePlain(",")
-			}
-			if err := def.Restore(ctx); err != nil {
-				return errors.Annotatef(err, "An error occurred while restore PartitionOptions.Definitions[%d]", i)
-			}
-		}
-		ctx.WritePlain(")")
-	}
-	return nil
-}
-
-// Accept implements Node Accept interface.
-func (n *TableGroupPartitionOption) Accept(v Visitor) (Node, bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-
-	n = newNode.(*TableGroupPartitionOption)
-	if !n.PartitionMethod.acceptInPlace(v) {
-		return n, false
-	}
-	if n.Sub != nil && !n.Sub.acceptInPlace(v) {
-		return n, false
-	}
-	for _, def := range n.Definitions {
-		if !def.acceptInPlace(v) {
-			return n, false
-		}
-	}
 	return v.Leave(n)
 }
 
@@ -1174,18 +1213,25 @@ func (n *TableGroupPartitionOption) Accept(v Visitor) (Node, bool) {
 type DropTableStmt struct {
 	ddlNode
 
-	IfExists    bool
-	Tables      []*TableName
-	IsView      bool
-	IsTemporary bool // make sense ONLY if/when IsView == false
+	IfExists         bool
+	Tables           []*TableName
+	IsView           bool
+	TemporaryKeyword // make sense ONLY if/when IsView == false
 }
 
 // Restore implements Node interface.
-func (n *DropTableStmt) Restore(ctx *RestoreCtx) error {
+func (n *DropTableStmt) Restore(ctx *format.RestoreCtx) error {
 	if n.IsView {
 		ctx.WriteKeyWord("DROP VIEW ")
 	} else {
-		ctx.WriteKeyWord("DROP TABLE ")
+		switch n.TemporaryKeyword {
+		case TemporaryNone:
+			ctx.WriteKeyWord("DROP TABLE ")
+		case TemporaryGlobal:
+			ctx.WriteKeyWord("DROP GLOBAL TEMPORARY TABLE ")
+		case TemporaryLocal:
+			ctx.WriteKeyWord("DROP TEMPORARY TABLE ")
+		}
 	}
 	if n.IfExists {
 		ctx.WriteKeyWord("IF EXISTS ")
@@ -1220,39 +1266,107 @@ func (n *DropTableStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// DropTableGroupStmt is a statement to drop one table group.
-type DropTableGroupStmt struct {
+// DropPlacementPolicyStmt is a statement to drop a Policy.
+type DropPlacementPolicyStmt struct {
 	ddlNode
 
 	IfExists   bool
-	TableGroup *TableGroupName
+	PolicyName model.CIStr
 }
 
-// Restore implements Node interface.
-func (n *DropTableGroupStmt) Restore(ctx *RestoreCtx) error {
-	ctx.WriteKeyWord("DROP TABLEGROUP ")
+// Restore implements Restore interface.
+func (n *DropPlacementPolicyStmt) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasTiDBSpecialCommentFlag() {
+		return restorePlacementStmtInSpecialComment(ctx, n)
+	}
+
+	ctx.WriteKeyWord("DROP PLACEMENT POLICY ")
 	if n.IfExists {
 		ctx.WriteKeyWord("IF EXISTS ")
 	}
-
-	if err := n.TableGroup.Restore(ctx); err != nil {
-		return errors.Annotate(err, "An error occurred while restore DropTableGroupStmt.TableGroup")
-	}
+	ctx.WriteName(n.PolicyName.O)
 	return nil
 }
 
-// Accept implements Node Accept interface.
-func (n *DropTableGroupStmt) Accept(v Visitor) (Node, bool) {
+func (n *DropPlacementPolicyStmt) Accept(v Visitor) (Node, bool) {
 	newNode, skipChildren := v.Enter(n)
 	if skipChildren {
 		return v.Leave(newNode)
 	}
-	n = newNode.(*DropTableGroupStmt)
-	node, ok := n.TableGroup.Accept(v)
-	if !ok {
-		return n, false
+	n = newNode.(*DropPlacementPolicyStmt)
+	return v.Leave(n)
+}
+
+type DropResourceGroupStmt struct {
+	ddlNode
+
+	IfExists          bool
+	ResourceGroupName model.CIStr
+}
+
+// Restore implements Restore interface.
+func (n *DropResourceGroupStmt) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasTiDBSpecialCommentFlag() {
+		return restoreStmtInSpecialComment(ctx, n, tidb.FeatureIDResourceGroup)
 	}
-	n.TableGroup = node.(*TableGroupName)
+
+	ctx.WriteKeyWord("DROP RESOURCE GROUP ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	ctx.WriteName(n.ResourceGroupName.O)
+	return nil
+}
+
+func (n *DropResourceGroupStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*DropResourceGroupStmt)
+	return v.Leave(n)
+}
+
+// DropSequenceStmt is a statement to drop a Sequence.
+type DropSequenceStmt struct {
+	ddlNode
+
+	IfExists  bool
+	Sequences []*TableName
+}
+
+// Restore implements Node interface.
+func (n *DropSequenceStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("DROP SEQUENCE ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	for i, sequence := range n.Sequences {
+		if i != 0 {
+			ctx.WritePlain(", ")
+		}
+		if err := sequence.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore DropSequenceStmt.Sequences[%d]", i)
+		}
+	}
+
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *DropSequenceStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*DropSequenceStmt)
+	for i, val := range n.Sequences {
+		node, ok := val.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Sequences[i] = node.(*TableName)
+	}
 	return v.Leave(n)
 }
 
@@ -1261,16 +1375,11 @@ func (n *DropTableGroupStmt) Accept(v Visitor) (Node, bool) {
 type RenameTableStmt struct {
 	ddlNode
 
-	OldTable *TableName
-	NewTable *TableName
-
-	// TableToTables is only useful for syncer which depends heavily on tidb parser to do some dirty work for now.
-	// TODO: Refactor this when you are going to add full support for multiple schema changes.
 	TableToTables []*TableToTable
 }
 
 // Restore implements Node interface.
-func (n *RenameTableStmt) Restore(ctx *RestoreCtx) error {
+func (n *RenameTableStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("RENAME TABLE ")
 	for index, table2table := range n.TableToTables {
 		if index != 0 {
@@ -1290,16 +1399,6 @@ func (n *RenameTableStmt) Accept(v Visitor) (Node, bool) {
 		return v.Leave(newNode)
 	}
 	n = newNode.(*RenameTableStmt)
-	node, ok := n.OldTable.Accept(v)
-	if !ok {
-		return n, false
-	}
-	n.OldTable = node.(*TableName)
-	node, ok = n.NewTable.Accept(v)
-	if !ok {
-		return n, false
-	}
-	n.NewTable = node.(*TableName)
 
 	for i, t := range n.TableToTables {
 		node, ok := t.Accept(v)
@@ -1320,7 +1419,7 @@ type TableToTable struct {
 }
 
 // Restore implements Node interface.
-func (n *TableToTable) Restore(ctx *RestoreCtx) error {
+func (n *TableToTable) Restore(ctx *format.RestoreCtx) error {
 	if err := n.OldTable.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore TableToTable.OldTable")
 	}
@@ -1368,7 +1467,7 @@ type CreateViewStmt struct {
 }
 
 // Restore implements Node interface.
-func (n *CreateViewStmt) Restore(ctx *RestoreCtx) error {
+func (n *CreateViewStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("CREATE ")
 	if n.OrReplace {
 		ctx.WriteKeyWord("OR REPLACE ")
@@ -1444,12 +1543,172 @@ func (n *CreateViewStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+// CreatePlacementPolicyStmt is a statement to create a policy.
+type CreatePlacementPolicyStmt struct {
+	ddlNode
+
+	OrReplace        bool
+	IfNotExists      bool
+	PolicyName       model.CIStr
+	PlacementOptions []*PlacementOption
+}
+
+// Restore implements Node interface.
+func (n *CreatePlacementPolicyStmt) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasTiDBSpecialCommentFlag() {
+		return restorePlacementStmtInSpecialComment(ctx, n)
+	}
+
+	ctx.WriteKeyWord("CREATE ")
+	if n.OrReplace {
+		ctx.WriteKeyWord("OR REPLACE ")
+	}
+	ctx.WriteKeyWord("PLACEMENT POLICY ")
+	if n.IfNotExists {
+		ctx.WriteKeyWord("IF NOT EXISTS ")
+	}
+	ctx.WriteName(n.PolicyName.O)
+	for i, option := range n.PlacementOptions {
+		ctx.WritePlain(" ")
+		if err := option.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while splicing CreatePlacementPolicy TableOption: [%v]", i)
+		}
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *CreatePlacementPolicyStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*CreatePlacementPolicyStmt)
+	return v.Leave(n)
+}
+
+// CreateResourceGroupStmt is a statement to create a policy.
+type CreateResourceGroupStmt struct {
+	ddlNode
+
+	IfNotExists             bool
+	ResourceGroupName       model.CIStr
+	ResourceGroupOptionList []*ResourceGroupOption
+}
+
+// Restore implements Node interface.
+func (n *CreateResourceGroupStmt) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasTiDBSpecialCommentFlag() {
+		return restoreStmtInSpecialComment(ctx, n, tidb.FeatureIDResourceGroup)
+	}
+
+	ctx.WriteKeyWord("CREATE ")
+
+	ctx.WriteKeyWord("RESOURCE GROUP ")
+	if n.IfNotExists {
+		ctx.WriteKeyWord("IF NOT EXISTS ")
+	}
+	ctx.WriteName(n.ResourceGroupName.O)
+	for i, option := range n.ResourceGroupOptionList {
+		if i > 0 {
+			ctx.WritePlain(",")
+		}
+		ctx.WritePlain(" ")
+		if err := option.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while splicing CreateResourceGroupStmt Option: [%v]", i)
+		}
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *CreateResourceGroupStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*CreateResourceGroupStmt)
+	return v.Leave(n)
+}
+
+// CreateSequenceStmt is a statement to create a Sequence.
+type CreateSequenceStmt struct {
+	ddlNode
+
+	// TODO : support or replace if need : care for it will conflict on temporaryOpt.
+	IfNotExists bool
+	Name        *TableName
+	SeqOptions  []*SequenceOption
+	TblOptions  []*TableOption
+}
+
+// Restore implements Node interface.
+func (n *CreateSequenceStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("CREATE ")
+	ctx.WriteKeyWord("SEQUENCE ")
+	if n.IfNotExists {
+		ctx.WriteKeyWord("IF NOT EXISTS ")
+	}
+	if err := n.Name.Restore(ctx); err != nil {
+		return errors.Annotate(err, "An error occurred while create CreateSequenceStmt.Name")
+	}
+	for i, option := range n.SeqOptions {
+		ctx.WritePlain(" ")
+		if err := option.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while splicing CreateSequenceStmt SequenceOption: [%v]", i)
+		}
+	}
+	for i, option := range n.TblOptions {
+		ctx.WritePlain(" ")
+		if err := option.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while splicing CreateSequenceStmt TableOption: [%v]", i)
+		}
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *CreateSequenceStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*CreateSequenceStmt)
+	node, ok := n.Name.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Name = node.(*TableName)
+	return v.Leave(n)
+}
+
 // IndexLockAndAlgorithm stores the algorithm option and the lock option.
 type IndexLockAndAlgorithm struct {
 	node
 
 	LockTp      LockType
 	AlgorithmTp AlgorithmType
+}
+
+// Restore implements Node interface.
+func (n *IndexLockAndAlgorithm) Restore(ctx *format.RestoreCtx) error {
+	hasPrevOption := false
+	if n.AlgorithmTp != AlgorithmTypeDefault {
+		ctx.WriteKeyWord("ALGORITHM")
+		ctx.WritePlain(" = ")
+		ctx.WriteKeyWord(n.AlgorithmTp.String())
+		hasPrevOption = true
+	}
+
+	if n.LockTp != LockTypeDefault {
+		if hasPrevOption {
+			ctx.WritePlain(" ")
+		}
+		ctx.WriteKeyWord("LOCK")
+		ctx.WritePlain(" = ")
+		ctx.WriteKeyWord(n.LockTp.String())
+	}
+	return nil
 }
 
 // Accept implements Node Accept interface.
@@ -1460,11 +1719,6 @@ func (n *IndexLockAndAlgorithm) Accept(v Visitor) (Node, bool) {
 	}
 	n = newNode.(*IndexLockAndAlgorithm)
 	return v.Leave(n)
-}
-
-// Restore implements IndexLockAndAlgorithm interface.
-func (n *IndexLockAndAlgorithm) Restore(ctx *RestoreCtx) error {
-	return nil
 }
 
 // IndexKeyType is the type for index key.
@@ -1487,23 +1741,32 @@ type CreateIndexStmt struct {
 	// see https://mariadb.com/kb/en/library/create-index/
 	IfNotExists bool
 
-	IndexName     string
-	Table         *TableName
-	Unique        bool
-	IndexColNames []*IndexColName
-	IndexOption   *IndexOption
-	KeyType       IndexKeyType
-	LockAlg       *IndexLockAndAlgorithm
-	Partition     *PartitionOptions
+	IndexName               string
+	Table                   *TableName
+	IndexPartSpecifications []*IndexPartSpecification
+	IndexOption             *IndexOption
+	KeyType                 IndexKeyType
+	LockAlg                 *IndexLockAndAlgorithm
+	// Partition is a goInception extension: CREATE INDEX ... [LOCAL|GLOBAL]
+	// partition options are carried through to the ALTER TABLE that runs it.
+	Partition *PartitionOptions
 }
 
 // Restore implements Node interface.
-func (n *CreateIndexStmt) Restore(ctx *RestoreCtx) error {
+func (n *CreateIndexStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("CREATE ")
-	if n.Unique {
+	switch n.KeyType {
+	case IndexKeyTypeUnique:
 		ctx.WriteKeyWord("UNIQUE ")
+	case IndexKeyTypeSpatial:
+		ctx.WriteKeyWord("SPATIAL ")
+	case IndexKeyTypeFullText:
+		ctx.WriteKeyWord("FULLTEXT ")
 	}
 	ctx.WriteKeyWord("INDEX ")
+	if n.IfNotExists {
+		ctx.WriteKeyWord("IF NOT EXISTS ")
+	}
 	ctx.WriteName(n.IndexName)
 	ctx.WriteKeyWord(" ON ")
 	if err := n.Table.Restore(ctx); err != nil {
@@ -1511,12 +1774,12 @@ func (n *CreateIndexStmt) Restore(ctx *RestoreCtx) error {
 	}
 
 	ctx.WritePlain(" (")
-	for i, indexColName := range n.IndexColNames {
+	for i, indexColName := range n.IndexPartSpecifications {
 		if i != 0 {
 			ctx.WritePlain(", ")
 		}
 		if err := indexColName.Restore(ctx); err != nil {
-			return errors.Annotatef(err, "An error occurred while restore CreateIndexStmt.IndexColNames: [%v]", i)
+			return errors.Annotatef(err, "An error occurred while restore CreateIndexStmt.IndexPartSpecifications: [%v]", i)
 		}
 	}
 	ctx.WritePlain(")")
@@ -1528,11 +1791,13 @@ func (n *CreateIndexStmt) Restore(ctx *RestoreCtx) error {
 		}
 	}
 
-	if n.Partition != nil {
-		if err := n.Partition.Restore(ctx); err != nil {
-			return errors.Annotate(err, "An error occurred while restore CreateIndexStmt.PartitionOpt")
+	if n.LockAlg != nil {
+		ctx.WritePlain(" ")
+		if err := n.LockAlg.Restore(ctx); err != nil {
+			return errors.Annotate(err, "An error occurred while restore CreateIndexStmt.LockAlg")
 		}
 	}
+
 	return nil
 }
 
@@ -1548,12 +1813,12 @@ func (n *CreateIndexStmt) Accept(v Visitor) (Node, bool) {
 		return n, false
 	}
 	n.Table = node.(*TableName)
-	for i, val := range n.IndexColNames {
+	for i, val := range n.IndexPartSpecifications {
 		node, ok = val.Accept(v)
 		if !ok {
 			return n, false
 		}
-		n.IndexColNames[i] = node.(*IndexColName)
+		n.IndexPartSpecifications[i] = node.(*IndexPartSpecification)
 	}
 	if n.IndexOption != nil {
 		node, ok := n.IndexOption.Accept(v)
@@ -1581,19 +1846,30 @@ type DropIndexStmt struct {
 	IndexName string
 	Table     *TableName
 	LockAlg   *IndexLockAndAlgorithm
+	IsHypo    bool // whether this operation is for a hypothetical index.
 }
 
 // Restore implements Node interface.
-func (n *DropIndexStmt) Restore(ctx *RestoreCtx) error {
+func (n *DropIndexStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("DROP INDEX ")
 	if n.IfExists {
-		ctx.WriteKeyWord("IF EXISTS ")
+		_ = ctx.WriteWithSpecialComments("", func() error {
+			ctx.WriteKeyWord("IF EXISTS ")
+			return nil
+		})
 	}
 	ctx.WriteName(n.IndexName)
 	ctx.WriteKeyWord(" ON ")
 
 	if err := n.Table.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while add index")
+	}
+
+	if n.LockAlg != nil {
+		ctx.WritePlain(" ")
+		if err := n.LockAlg.Restore(ctx); err != nil {
+			return errors.Annotate(err, "An error occurred while restore CreateIndexStmt.LockAlg")
+		}
 	}
 
 	return nil
@@ -1707,8 +1983,17 @@ func (n *CleanupTableLockStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// Restore implements CleanupTableLockStmt interface.
-func (n *CleanupTableLockStmt) Restore(ctx *RestoreCtx) error {
+// Restore implements Node interface.
+func (n *CleanupTableLockStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("ADMIN CLEANUP TABLE LOCK ")
+	for i, v := range n.Tables {
+		if i != 0 {
+			ctx.WritePlain(", ")
+		}
+		if err := v.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore CleanupTableLockStmt.Tables[%d]", i)
+		}
+	}
 	return nil
 }
 
@@ -1768,6 +2053,7 @@ const (
 	PlacementOptionLearnerConstraints
 	PlacementOptionFollowerConstraints
 	PlacementOptionVoterConstraints
+	PlacementOptionSurvivalPreferences
 	PlacementOptionPolicy
 )
 
@@ -1779,64 +2065,243 @@ type PlacementOption struct {
 }
 
 func (n *PlacementOption) Restore(ctx *format.RestoreCtx) error {
-	isSupported := true
-	switch n.Tp {
-	case PlacementOptionPrimaryRegion:
-		ctx.WriteKeyWord("PRIMARY_REGION ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case PlacementOptionRegions:
-		ctx.WriteKeyWord("REGIONS ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case PlacementOptionFollowerCount:
-		ctx.WriteKeyWord("FOLLOWERS ")
-		ctx.WritePlain("= ")
-		ctx.WritePlainf("%d", n.UintValue)
-	case PlacementOptionVoterCount:
-		ctx.WriteKeyWord("VOTERS ")
-		ctx.WritePlain("= ")
-		ctx.WritePlainf("%d", n.UintValue)
-	case PlacementOptionLearnerCount:
-		ctx.WriteKeyWord("LEARNERS ")
-		ctx.WritePlain("= ")
-		ctx.WritePlainf("%d", n.UintValue)
-	case PlacementOptionSchedule:
-		ctx.WriteKeyWord("SCHEDULE ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case PlacementOptionConstraints:
-		ctx.WriteKeyWord("CONSTRAINTS ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case PlacementOptionLeaderConstraints:
-		ctx.WriteKeyWord("LEADER_CONSTRAINTS ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case PlacementOptionFollowerConstraints:
-		ctx.WriteKeyWord("FOLLOWER_CONSTRAINTS ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case PlacementOptionVoterConstraints:
-		ctx.WriteKeyWord("VOTER_CONSTRAINTS ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case PlacementOptionLearnerConstraints:
-		ctx.WriteKeyWord("LEARNER_CONSTRAINTS ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case PlacementOptionPolicy:
-		ctx.WriteKeyWord("PLACEMENT POLICY ")
-		ctx.WritePlain("= ")
-		ctx.WriteName(n.StrValue)
-	default:
-		isSupported = false
+	if ctx.Flags.HasSkipPlacementRuleForRestoreFlag() {
+		return nil
 	}
-	if !isSupported {
-		return errors.Errorf("invalid PlacementOption: %d", n.Tp)
+	fn := func() error {
+		switch n.Tp {
+		case PlacementOptionPrimaryRegion:
+			ctx.WriteKeyWord("PRIMARY_REGION ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		case PlacementOptionRegions:
+			ctx.WriteKeyWord("REGIONS ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		case PlacementOptionFollowerCount:
+			ctx.WriteKeyWord("FOLLOWERS ")
+			ctx.WritePlain("= ")
+			ctx.WritePlainf("%d", n.UintValue)
+		case PlacementOptionVoterCount:
+			ctx.WriteKeyWord("VOTERS ")
+			ctx.WritePlain("= ")
+			ctx.WritePlainf("%d", n.UintValue)
+		case PlacementOptionLearnerCount:
+			ctx.WriteKeyWord("LEARNERS ")
+			ctx.WritePlain("= ")
+			ctx.WritePlainf("%d", n.UintValue)
+		case PlacementOptionSchedule:
+			ctx.WriteKeyWord("SCHEDULE ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		case PlacementOptionConstraints:
+			ctx.WriteKeyWord("CONSTRAINTS ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		case PlacementOptionLeaderConstraints:
+			ctx.WriteKeyWord("LEADER_CONSTRAINTS ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		case PlacementOptionFollowerConstraints:
+			ctx.WriteKeyWord("FOLLOWER_CONSTRAINTS ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		case PlacementOptionVoterConstraints:
+			ctx.WriteKeyWord("VOTER_CONSTRAINTS ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		case PlacementOptionLearnerConstraints:
+			ctx.WriteKeyWord("LEARNER_CONSTRAINTS ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		case PlacementOptionPolicy:
+			ctx.WriteKeyWord("PLACEMENT POLICY ")
+			ctx.WritePlain("= ")
+			ctx.WriteName(n.StrValue)
+		case PlacementOptionSurvivalPreferences:
+			ctx.WriteKeyWord("SURVIVAL_PREFERENCES ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+		default:
+			return errors.Errorf("invalid PlacementOption: %d", n.Tp)
+		}
+		return nil
+	}
+	// WriteSpecialComment
+	return ctx.WriteWithSpecialComments(tidb.FeatureIDPlacement, fn)
+}
+
+// ResourceGroupOption is used for parsing resource group option.
+type ResourceGroupOption struct {
+	Tp                ResourceUnitType
+	StrValue          string
+	UintValue         uint64
+	BoolValue         bool
+	RunawayOptionList []*ResourceGroupRunawayOption
+	BackgroundOptions []*ResourceGroupBackgroundOption
+}
+
+type ResourceUnitType int
+
+const (
+	// RU mode
+	ResourceRURate ResourceUnitType = iota
+	ResourcePriority
+	// Raw mode
+	ResourceUnitCPU
+	ResourceUnitIOReadBandwidth
+	ResourceUnitIOWriteBandwidth
+
+	// Options
+	ResourceBurstableOpiton
+	ResourceGroupRunaway
+	ResourceGroupBackground
+)
+
+func (n *ResourceGroupOption) Restore(ctx *format.RestoreCtx) error {
+	switch n.Tp {
+	case ResourceRURate:
+		ctx.WriteKeyWord("RU_PER_SEC ")
+		ctx.WritePlain("= ")
+		ctx.WritePlainf("%d", n.UintValue)
+	case ResourcePriority:
+		ctx.WriteKeyWord("PRIORITY ")
+		ctx.WritePlain("= ")
+		ctx.WriteKeyWord(model.PriorityValueToName(n.UintValue))
+	case ResourceUnitCPU:
+		ctx.WriteKeyWord("CPU ")
+		ctx.WritePlain("= ")
+		ctx.WriteString(n.StrValue)
+	case ResourceUnitIOReadBandwidth:
+		ctx.WriteKeyWord("IO_READ_BANDWIDTH ")
+		ctx.WritePlain("= ")
+		ctx.WriteString(n.StrValue)
+	case ResourceUnitIOWriteBandwidth:
+		ctx.WriteKeyWord("IO_WRITE_BANDWIDTH ")
+		ctx.WritePlain("= ")
+		ctx.WriteString(n.StrValue)
+	case ResourceBurstableOpiton:
+		ctx.WriteKeyWord("BURSTABLE ")
+		ctx.WritePlain("= ")
+		ctx.WritePlain(strings.ToUpper(fmt.Sprintf("%v", n.BoolValue)))
+	case ResourceGroupRunaway:
+		ctx.WritePlain("QUERY_LIMIT ")
+		ctx.WritePlain("= ")
+		if len(n.RunawayOptionList) > 0 {
+			ctx.WritePlain("(")
+			for i, option := range n.RunawayOptionList {
+				if i > 0 {
+					ctx.WritePlain(" ")
+				}
+				if err := option.Restore(ctx); err != nil {
+					return errors.Annotatef(err, "An error occurred while splicing ResourceGroupRunaway Option: [%v]", option)
+				}
+			}
+			ctx.WritePlain(")")
+		} else {
+			ctx.WritePlain("NULL")
+		}
+	case ResourceGroupBackground:
+		ctx.WritePlain("BACKGROUND ")
+		ctx.WritePlain("= ")
+		if len(n.BackgroundOptions) > 0 {
+			ctx.WritePlain("(")
+			for i, option := range n.BackgroundOptions {
+				if i > 0 {
+					ctx.WritePlain(", ")
+				}
+				if err := option.Restore(ctx); err != nil {
+					return errors.Annotatef(err, "An error occurred while splicing ResourceGroup Background Option: [%v]", option)
+				}
+			}
+			ctx.WritePlain(")")
+		} else {
+			ctx.WritePlain("NULL")
+		}
+	default:
+		return errors.Errorf("invalid ResourceGroupOption: %d", n.Tp)
 	}
 	return nil
 }
+
+type RunawayOptionType int
+
+const (
+	RunawayRule RunawayOptionType = iota
+	RunawayAction
+	RunawayWatch
+)
+
+// ResourceGroupRunawayOption is used for parsing resource group runaway rule option.
+type ResourceGroupRunawayOption struct {
+	Tp       RunawayOptionType
+	StrValue string
+	IntValue int32
+}
+
+func (n *ResourceGroupRunawayOption) Restore(ctx *format.RestoreCtx) error {
+	switch n.Tp {
+	case RunawayRule:
+		ctx.WriteKeyWord("EXEC_ELAPSED ")
+		ctx.WritePlain("= ")
+		ctx.WriteString(n.StrValue)
+	case RunawayAction:
+		ctx.WriteKeyWord("ACTION ")
+		ctx.WritePlain("= ")
+		ctx.WriteKeyWord(model.RunawayActionType(n.IntValue).String())
+	case RunawayWatch:
+		ctx.WriteKeyWord("WATCH ")
+		ctx.WritePlain("= ")
+		ctx.WriteKeyWord(model.RunawayWatchType(n.IntValue).String())
+		ctx.WritePlain(" ")
+		ctx.WriteKeyWord("DURATION ")
+		ctx.WritePlain("= ")
+		if len(n.StrValue) > 0 {
+			ctx.WriteString(n.StrValue)
+		} else {
+			ctx.WriteKeyWord("UNLIMITED")
+		}
+	default:
+		return errors.Errorf("invalid ResourceGroupRunawayOption: %d", n.Tp)
+	}
+	return nil
+}
+
+type BackgroundOptionType int
+
+const (
+	BackgroundOptionNone BackgroundOptionType = iota
+	BackgroundOptionTaskNames
+)
+
+// ResourceGroupBackgroundOption is used to config background job settings.
+type ResourceGroupBackgroundOption struct {
+	Type     BackgroundOptionType
+	StrValue string
+}
+
+func (n *ResourceGroupBackgroundOption) Restore(ctx *format.RestoreCtx) error {
+	switch n.Type {
+	case BackgroundOptionTaskNames:
+		ctx.WriteKeyWord("TASK_TYPES ")
+		ctx.WritePlain("= ")
+		ctx.WriteString(n.StrValue)
+	default:
+		return errors.Errorf("unknown ResourceGroupBackgroundOption: %d", n.Type)
+	}
+
+	return nil
+}
+
+type StatsOptionType int
+
+const (
+	StatsOptionBuckets StatsOptionType = 0x5000 + iota
+	StatsOptionTopN
+	StatsOptionColsChoice
+	StatsOptionColList
+	StatsOptionSampleRate
+)
 
 // TableOptionType is the type for TableOption
 type TableOptionType int
@@ -1847,7 +2312,7 @@ const (
 	TableOptionEngine
 	TableOptionCharset
 	TableOptionCollate
-	TableOptionAutoIdCache
+	TableOptionAutoIdCache //nolint:revive
 	TableOptionAutoIncrement
 	TableOptionAutoRandomBase
 	TableOptionComment
@@ -1878,19 +2343,17 @@ const (
 	TableOptionTableCheckSum
 	TableOptionUnion
 	TableOptionEncryption
+	// TableOptionTableGroup is a goInception extension for OceanBase TABLEGROUP.
 	TableOptionTableGroup
-	TableOptionPlacementPrimaryRegion       = TableOptionType(PlacementOptionPrimaryRegion)
-	TableOptionPlacementRegions             = TableOptionType(PlacementOptionRegions)
-	TableOptionPlacementFollowerCount       = TableOptionType(PlacementOptionFollowerCount)
-	TableOptionPlacementVoterCount          = TableOptionType(PlacementOptionVoterCount)
-	TableOptionPlacementLearnerCount        = TableOptionType(PlacementOptionLearnerCount)
-	TableOptionPlacementSchedule            = TableOptionType(PlacementOptionSchedule)
-	TableOptionPlacementConstraints         = TableOptionType(PlacementOptionConstraints)
-	TableOptionPlacementLeaderConstraints   = TableOptionType(PlacementOptionLeaderConstraints)
-	TableOptionPlacementLearnerConstraints  = TableOptionType(PlacementOptionLearnerConstraints)
-	TableOptionPlacementFollowerConstraints = TableOptionType(PlacementOptionFollowerConstraints)
-	TableOptionPlacementVoterConstraints    = TableOptionType(PlacementOptionVoterConstraints)
-	TableOptionPlacementPolicy              = TableOptionType(PlacementOptionPolicy)
+	TableOptionTTL
+	TableOptionTTLEnable
+	TableOptionTTLJobInterval
+	TableOptionPlacementPolicy = TableOptionType(PlacementOptionPolicy)
+	TableOptionStatsBuckets    = TableOptionType(StatsOptionBuckets)
+	TableOptionStatsTopN       = TableOptionType(StatsOptionTopN)
+	TableOptionStatsColsChoice = TableOptionType(StatsOptionColsChoice)
+	TableOptionStatsColList    = TableOptionType(StatsOptionColList)
+	TableOptionStatsSampleRate = TableOptionType(StatsOptionSampleRate)
 )
 
 // RowFormat types
@@ -1909,6 +2372,7 @@ const (
 	TokuDBRowFormatLzma
 	TokuDBRowFormatSnappy
 	TokuDBRowFormatUncompressed
+	TokuDBRowFormatZstd
 )
 
 // OnDuplicateKeyHandlingType is the option that handle unique key values in 'CREATE TABLE ... SELECT' or `LOAD DATA`.
@@ -1930,12 +2394,16 @@ const (
 
 // TableOption is used for parsing table option from SQL.
 type TableOption struct {
-	Tp         TableOptionType
-	Default    bool
-	StrValue   string
-	UintValue  uint64
-	BoolValue  bool
-	TableNames []*TableName
+	node
+	Tp            TableOptionType
+	Default       bool
+	StrValue      string
+	UintValue     uint64
+	BoolValue     bool
+	TimeUnitValue *TimeUnitExpr
+	Value         ValueExpr
+	TableNames    []*TableName
+	ColumnName    *ColumnName
 }
 
 func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
@@ -1968,13 +2436,37 @@ func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
 		ctx.WritePlain("= ")
 		ctx.WriteKeyWord(n.StrValue)
 	case TableOptionAutoIncrement:
+		if n.BoolValue {
+			_ = ctx.WriteWithSpecialComments(tidb.FeatureIDForceAutoInc, func() error {
+				ctx.WriteKeyWord("FORCE")
+				return nil
+			})
+			ctx.WritePlain(" ")
+		}
 		ctx.WriteKeyWord("AUTO_INCREMENT ")
 		ctx.WritePlain("= ")
 		ctx.WritePlainf("%d", n.UintValue)
+	case TableOptionAutoIdCache:
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDAutoIDCache, func() error {
+			ctx.WriteKeyWord("AUTO_ID_CACHE ")
+			ctx.WritePlain("= ")
+			ctx.WritePlainf("%d", n.UintValue)
+			return nil
+		})
 	case TableOptionAutoRandomBase:
-		ctx.WriteKeyWord("AUTO_RANDOM_BASE ")
-		ctx.WritePlain("= ")
-		ctx.WritePlainf("%d", n.UintValue)
+		if n.BoolValue {
+			_ = ctx.WriteWithSpecialComments(tidb.FeatureIDForceAutoInc, func() error {
+				ctx.WriteKeyWord("FORCE")
+				return nil
+			})
+			ctx.WritePlain(" ")
+		}
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDAutoRandomBase, func() error {
+			ctx.WriteKeyWord("AUTO_RANDOM_BASE ")
+			ctx.WritePlain("= ")
+			ctx.WritePlainf("%d", n.UintValue)
+			return nil
+		})
 	case TableOptionComment:
 		ctx.WriteKeyWord("COMMENT ")
 		ctx.WritePlain("= ")
@@ -2045,6 +2537,8 @@ func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
 			ctx.WriteKeyWord("TOKUDB_LZMA")
 		case TokuDBRowFormatSnappy:
 			ctx.WriteKeyWord("TOKUDB_SNAPPY")
+		case TokuDBRowFormatZstd:
+			ctx.WriteKeyWord("TOKUDB_ZSTD")
 		case TokuDBRowFormatUncompressed:
 			ctx.WriteKeyWord("TOKUDB_UNCOMPRESSED")
 		default:
@@ -2065,11 +2559,17 @@ func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
 			ctx.WritePlainf("%d", n.UintValue)
 		}
 	case TableOptionShardRowID:
-		ctx.WriteKeyWord("SHARD_ROW_ID_BITS ")
-		ctx.WritePlainf("= %d", n.UintValue)
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDTiDB, func() error {
+			ctx.WriteKeyWord("SHARD_ROW_ID_BITS ")
+			ctx.WritePlainf("= %d", n.UintValue)
+			return nil
+		})
 	case TableOptionPreSplitRegion:
-		ctx.WriteKeyWord("PRE_SPLIT_REGIONS ")
-		ctx.WritePlainf("= %d", n.UintValue)
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDTiDB, func() error {
+			ctx.WriteKeyWord("PRE_SPLIT_REGIONS ")
+			ctx.WritePlainf("= %d", n.UintValue)
+			return nil
+		})
 	case TableOptionPackKeys:
 		// TODO: not support
 		ctx.WriteKeyWord("PACK_KEYS ")
@@ -2113,7 +2613,7 @@ func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
 	case TableOptionInsertMethod:
 		ctx.WriteKeyWord("INSERT_METHOD ")
 		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
+		ctx.WriteKeyWord(n.StrValue)
 	case TableOptionTableCheckSum:
 		ctx.WriteKeyWord("TABLE_CHECKSUM ")
 		ctx.WritePlain("= ")
@@ -2132,19 +2632,178 @@ func (n *TableOption) Restore(ctx *format.RestoreCtx) error {
 		ctx.WriteKeyWord("ENCRYPTION ")
 		ctx.WritePlain("= ")
 		ctx.WriteString(n.StrValue)
-	case TableOptionTableGroup:
-		ctx.WriteKeyWord("TABLEGROUP ")
-		ctx.WritePlain("= ")
-		ctx.WriteString(n.StrValue)
-	case TableOptionPlacementPrimaryRegion, TableOptionPlacementRegions, TableOptionPlacementFollowerCount, TableOptionPlacementLeaderConstraints, TableOptionPlacementLearnerCount, TableOptionPlacementVoterCount, TableOptionPlacementSchedule, TableOptionPlacementConstraints, TableOptionPlacementFollowerConstraints, TableOptionPlacementVoterConstraints, TableOptionPlacementLearnerConstraints, TableOptionPlacementPolicy:
+	case TableOptionPlacementPolicy:
+		if ctx.Flags.HasSkipPlacementRuleForRestoreFlag() {
+			return nil
+		}
 		placementOpt := PlacementOption{
-			Tp:        PlacementOptionType(n.Tp),
+			Tp:        PlacementOptionPolicy,
 			UintValue: n.UintValue,
 			StrValue:  n.StrValue,
 		}
 		return placementOpt.Restore(ctx)
+	case TableOptionStatsBuckets:
+		ctx.WriteKeyWord("STATS_BUCKETS ")
+		ctx.WritePlain("= ")
+		if n.Default {
+			ctx.WriteKeyWord("DEFAULT")
+		} else {
+			ctx.WritePlainf("%d", n.UintValue)
+		}
+	case TableOptionStatsTopN:
+		ctx.WriteKeyWord("STATS_TOPN ")
+		ctx.WritePlain("= ")
+		if n.Default {
+			ctx.WriteKeyWord("DEFAULT")
+		} else {
+			ctx.WritePlainf("%d", n.UintValue)
+		}
+	case TableOptionStatsSampleRate:
+		ctx.WriteKeyWord("STATS_SAMPLE_RATE ")
+		ctx.WritePlain("= ")
+		if n.Default {
+			ctx.WriteKeyWord("DEFAULT")
+		} else {
+			ctx.WritePlainf("%v", n.Value.GetValue())
+		}
+	case TableOptionStatsColsChoice:
+		ctx.WriteKeyWord("STATS_COL_CHOICE ")
+		ctx.WritePlain("= ")
+		if n.Default {
+			ctx.WriteKeyWord("DEFAULT")
+		} else {
+			ctx.WriteString(n.StrValue)
+		}
+	case TableOptionStatsColList:
+		ctx.WriteKeyWord("STATS_COL_LIST ")
+		ctx.WritePlain("= ")
+		if n.Default {
+			ctx.WriteKeyWord("DEFAULT")
+		} else {
+			ctx.WriteString(n.StrValue)
+		}
+	case TableOptionTTL:
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDTTL, func() error {
+			ctx.WriteKeyWord("TTL ")
+			ctx.WritePlain("= ")
+			ctx.WriteName(n.ColumnName.Name.String())
+			ctx.WritePlain(" + INTERVAL ")
+			err := n.Value.Restore(ctx)
+			ctx.WritePlain(" ")
+			if err != nil {
+				return err
+			}
+			return n.TimeUnitValue.Restore(ctx)
+		})
+	case TableOptionTTLEnable:
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDTTL, func() error {
+			ctx.WriteKeyWord("TTL_ENABLE ")
+			ctx.WritePlain("= ")
+			if n.BoolValue {
+				ctx.WriteString("ON")
+			} else {
+				ctx.WriteString("OFF")
+			}
+			return nil
+		})
+	case TableOptionTTLJobInterval:
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDTTL, func() error {
+			ctx.WriteKeyWord("TTL_JOB_INTERVAL ")
+			ctx.WritePlain("= ")
+			ctx.WriteString(n.StrValue)
+			return nil
+		})
 	default:
 		return errors.Errorf("invalid TableOption: %d", n.Tp)
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *TableOption) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*TableOption)
+	if n.Value != nil {
+		node, ok := n.Value.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Value = node.(ValueExpr)
+	}
+	if n.TimeUnitValue != nil {
+		node, ok := n.TimeUnitValue.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.TimeUnitValue = node.(*TimeUnitExpr)
+	}
+	return v.Leave(n)
+}
+
+// SequenceOptionType is the type for SequenceOption
+type SequenceOptionType int
+
+// SequenceOption types.
+const (
+	SequenceOptionNone SequenceOptionType = iota
+	SequenceOptionIncrementBy
+	SequenceStartWith
+	SequenceNoMinValue
+	SequenceMinValue
+	SequenceNoMaxValue
+	SequenceMaxValue
+	SequenceNoCache
+	SequenceCache
+	SequenceNoCycle
+	SequenceCycle
+	// SequenceRestart is only used in alter sequence statement.
+	SequenceRestart
+	SequenceRestartWith
+)
+
+// SequenceOption is used for parsing sequence option from SQL.
+type SequenceOption struct {
+	Tp       SequenceOptionType
+	IntValue int64
+}
+
+func (n *SequenceOption) Restore(ctx *format.RestoreCtx) error {
+	switch n.Tp {
+	case SequenceOptionIncrementBy:
+		ctx.WriteKeyWord("INCREMENT BY ")
+		ctx.WritePlainf("%d", n.IntValue)
+	case SequenceStartWith:
+		ctx.WriteKeyWord("START WITH ")
+		ctx.WritePlainf("%d", n.IntValue)
+	case SequenceNoMinValue:
+		ctx.WriteKeyWord("NO MINVALUE")
+	case SequenceMinValue:
+		ctx.WriteKeyWord("MINVALUE ")
+		ctx.WritePlainf("%d", n.IntValue)
+	case SequenceNoMaxValue:
+		ctx.WriteKeyWord("NO MAXVALUE")
+	case SequenceMaxValue:
+		ctx.WriteKeyWord("MAXVALUE ")
+		ctx.WritePlainf("%d", n.IntValue)
+	case SequenceNoCache:
+		ctx.WriteKeyWord("NOCACHE")
+	case SequenceCache:
+		ctx.WriteKeyWord("CACHE ")
+		ctx.WritePlainf("%d", n.IntValue)
+	case SequenceNoCycle:
+		ctx.WriteKeyWord("NOCYCLE")
+	case SequenceCycle:
+		ctx.WriteKeyWord("CYCLE")
+	case SequenceRestart:
+		ctx.WriteKeyWord("RESTART")
+	case SequenceRestartWith:
+		ctx.WriteKeyWord("RESTART WITH ")
+		ctx.WritePlainf("%d", n.IntValue)
+	default:
+		return errors.Errorf("invalid SequenceOption: %d", n.Tp)
 	}
 	return nil
 }
@@ -2169,7 +2828,7 @@ type ColumnPosition struct {
 }
 
 // Restore implements Node interface.
-func (n *ColumnPosition) Restore(ctx *RestoreCtx) error {
+func (n *ColumnPosition) Restore(ctx *format.RestoreCtx) error {
 	switch n.Tp {
 	case ColumnPositionNone:
 		// do nothing
@@ -2226,6 +2885,9 @@ const (
 	AlterTableRenameIndex
 	AlterTableForce
 	AlterTableAddPartitions
+	// A tombstone for `AlterTableAlterPartition` in the upstream parser.
+	// goInception still uses ALTER TABLEGROUP ... ALTER PARTITION, so the name
+	// is kept here at the same position to keep the enum number unchanged.
 	AlterTableAlterPartition
 	AlterTablePartitionAttributes
 	AlterTablePartitionOptions
@@ -2257,13 +2919,22 @@ const (
 	AlterTableOrderByColumns
 	// AlterTableSetTiFlashReplica uses to set the table TiFlash replica.
 	AlterTableSetTiFlashReplica
-	AlterTablePlacement
+	// A tombstone for `AlterTablePlacement`. It will never be used anymore.
+	// Just left a tombstone here to keep the enum number unchanged.
+	__DEPRECATED_AlterTablePlacement //nolint:revive
 	AlterTableAddStatistics
 	AlterTableDropStatistics
 	AlterTableAttributes
+	AlterTableCache
+	AlterTableNoCache
+	AlterTableStatsOptions
+	AlterTableDropFirstPartition
+	AlterTableAddLastPartition
+	AlterTableReorganizeLastPartition
+	AlterTableReorganizeFirstPartition
+	AlterTableRemoveTTL
+	// AlterTableDropTableGroup is a goInception extension for OceanBase TABLEGROUP.
 	AlterTableDropTableGroup
-
-	// TODO: Add more actions
 )
 
 // LockType is the type for AlterTableSpec.
@@ -2291,35 +2962,6 @@ const (
 	LockTypeShared
 	LockTypeExclusive
 )
-
-// AlterAlgorithm is the algorithm of the DDL operations.
-// See https://dev.mysql.com/doc/refman/8.0/en/alter-table.html#alter-table-performance.
-type AlterAlgorithm byte
-
-// DDL alter algorithms.
-// For now, TiDB only supported inplace and instance algorithms. If the user specify `copy`,
-// will get an error.
-const (
-	AlterAlgorithmDefault AlterAlgorithm = iota
-	AlterAlgorithmCopy
-	AlterAlgorithmInplace
-	AlterAlgorithmInstant
-)
-
-func (a AlterAlgorithm) String() string {
-	switch a {
-	case AlterAlgorithmDefault:
-		return "DEFAULT"
-	case AlterAlgorithmCopy:
-		return "COPY"
-	case AlterAlgorithmInplace:
-		return "INPLACE"
-	case AlterAlgorithmInstant:
-		return "INSTANT"
-	default:
-		return "DEFAULT"
-	}
-}
 
 // AlgorithmType is the algorithm of the DDL operations.
 // See https://dev.mysql.com/doc/refman/8.0/en/alter-table.html#alter-table-performance.
@@ -2365,39 +3007,40 @@ type AlterTableSpec struct {
 	NoWriteToBinlog bool
 	OnAllPartitions bool
 
-	Tp              AlterTableType
-	Name            string
-	IndexName       model.CIStr
-	Constraint      *Constraint
-	Options         []*TableOption
-	OrderByList     []*AlterOrderItem
-	NewTable        *TableName
-	NewColumns      []*ColumnDef
-	NewConstraints  []*Constraint
-	OldColumnName   *ColumnName
-	NewColumnName   *ColumnName
-	Position        *ColumnPosition
-	LockType        LockType
-	Algorithm       AlgorithmType
-	Comment         string
-	FromKey         model.CIStr
-	ToKey           model.CIStr
-	Partition       *PartitionOptions
-	PartitionNames  []model.CIStr
-	PartDefinitions []*PartitionDefinition
-	WithValidation  bool
-	Num             uint64
-	Visibility      IndexVisibility
-	TiFlashReplica  *TiFlashReplicaSpec
-	PlacementSpecs  []*PlacementSpec
-	Writeable       bool
-	Statistics      *StatisticsSpec
-	AttributesSpec  *AttributesSpec
+	Tp               AlterTableType
+	Name             string
+	IndexName        model.CIStr
+	Constraint       *Constraint
+	Options          []*TableOption
+	OrderByList      []*AlterOrderItem
+	NewTable         *TableName
+	NewColumns       []*ColumnDef
+	NewConstraints   []*Constraint
+	OldColumnName    *ColumnName
+	NewColumnName    *ColumnName
+	Position         *ColumnPosition
+	LockType         LockType
+	Algorithm        AlgorithmType
+	Comment          string
+	FromKey          model.CIStr
+	ToKey            model.CIStr
+	Partition        *PartitionOptions
+	PartitionNames   []model.CIStr
+	PartDefinitions  []*PartitionDefinition
+	WithValidation   bool
+	Num              uint64
+	Visibility       IndexVisibility
+	TiFlashReplica   *TiFlashReplicaSpec
+	Writeable        bool
+	Statistics       *StatisticsSpec
+	AttributesSpec   *AttributesSpec
+	StatsOptionsSpec *StatsOptionsSpec
 }
 
 type TiFlashReplicaSpec struct {
 	Count  uint64
 	Labels []string
+	Hypo   bool // hypothetical replica is used by index advisor
 }
 
 // AlterOrderItem represents an item in order by at alter table stmt.
@@ -2418,8 +3061,25 @@ func (n *AlterOrderItem) Restore(ctx *format.RestoreCtx) error {
 	return nil
 }
 
+func (n *AlterTableSpec) IsAllPlacementRule() bool {
+	switch n.Tp {
+	case AlterTablePartitionAttributes, AlterTablePartitionOptions, AlterTableOption, AlterTableAttributes:
+		for _, o := range n.Options {
+			if o.Tp != TableOptionPlacementPolicy {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 // Restore implements Node interface.
 func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
+	if n.IsAllPlacementRule() && ctx.Flags.HasSkipPlacementRuleForRestoreFlag() {
+		return nil
+	}
 	switch n.Tp {
 	case AlterTableSetTiFlashReplica:
 		ctx.WriteKeyWord("SET TIFLASH REPLICA ")
@@ -2610,8 +3270,16 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 		if len(n.NewColumns[0].Options) == 1 {
 			ctx.WriteKeyWord("SET DEFAULT ")
 			expr := n.NewColumns[0].Options[0].Expr
-			if err := expr.Restore(ctx); err != nil {
-				return errors.Annotate(err, "An error occurred while restore AlterTableSpec.NewColumns[0].Options[0].Expr")
+			if valueExpr, ok := expr.(ValueExpr); ok {
+				if err := valueExpr.Restore(ctx); err != nil {
+					return errors.Annotate(err, "An error occurred while restore AlterTableSpec.NewColumns[0].Options[0].Expr")
+				}
+			} else {
+				ctx.WritePlain("(")
+				if err := expr.Restore(ctx); err != nil {
+					return errors.Annotate(err, "An error occurred while restore AlterTableSpec.NewColumns[0].Options[0].Expr")
+				}
+				ctx.WritePlain(")")
 			}
 		} else {
 			ctx.WriteKeyWord(" DROP DEFAULT")
@@ -2673,35 +3341,56 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 			ctx.WriteKeyWord(" PARTITIONS ")
 			ctx.WritePlainf("%d", n.Num)
 		}
-	case AlterTableAlterPartition:
-		if len(n.PartitionNames) != 1 {
-			return errors.Errorf("Maybe partition options are combined.")
+	case AlterTableDropFirstPartition:
+		ctx.WriteKeyWord("FIRST PARTITION LESS THAN (")
+		if err := n.Partition.PartitionMethod.Expr.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore AlterTableDropFirstPartition Exprs")
 		}
-
-		ctx.WriteKeyWord("ALTER PARTITION ")
-		ctx.WriteName(n.PartitionNames[0].O)
-		ctx.WritePlain(" ")
-
-		for i, spec := range n.PlacementSpecs {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			if err := spec.Restore(ctx); err != nil {
-				return errors.Annotatef(err, "An error occurred while restore AlterTableSpec.PlacementSpecs[%d]", i)
-			}
+		ctx.WriteKeyWord(")")
+		if n.NoWriteToBinlog {
+			ctx.WriteKeyWord(" NO_WRITE_TO_BINLOG")
+		}
+	case AlterTableAddLastPartition:
+		ctx.WriteKeyWord("LAST PARTITION LESS THAN (")
+		if err := n.Partition.PartitionMethod.Expr.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore AlterTableAddLastPartition Exprs")
+		}
+		ctx.WriteKeyWord(")")
+		if n.NoWriteToBinlog {
+			ctx.WriteKeyWord(" NO_WRITE_TO_BINLOG")
 		}
 	case AlterTablePartitionOptions:
-		ctx.WriteKeyWord("PARTITION ")
-		ctx.WriteName(n.PartitionNames[0].O)
-		ctx.WritePlain(" ")
+		restoreWithoutSpecialComment := func() error {
+			origFlags := ctx.Flags
+			defer func() {
+				ctx.Flags = origFlags
+			}()
+			ctx.Flags &= ^format.RestoreTiDBSpecialComment
+			ctx.WriteKeyWord("PARTITION ")
+			ctx.WriteName(n.PartitionNames[0].O)
+			ctx.WritePlain(" ")
 
-		for i, opt := range n.Options {
-			if i != 0 {
-				ctx.WritePlain(" ")
+			for i, opt := range n.Options {
+				if i != 0 {
+					ctx.WritePlain(" ")
+				}
+				if err := opt.Restore(ctx); err != nil {
+					return errors.Annotatef(err, "An error occurred while restore AlterTableSpec.Options[%d] for PARTITION `%s`", i, n.PartitionNames[0].O)
+				}
 			}
-			if err := opt.Restore(ctx); err != nil {
-				return errors.Annotatef(err, "An error occurred while restore AlterTableSpec.Options[%d] for PARTITION `%s`", i, n.PartitionNames[0].O)
-			}
+			return nil
+		}
+
+		var err error
+		if ctx.Flags.HasTiDBSpecialCommentFlag() {
+			// AlterTablePartitionOptions now only supports placement options, so add put all options to special comment
+			err = ctx.WriteWithSpecialComments(tidb.FeatureIDPlacement, restoreWithoutSpecialComment)
+		} else {
+			err = restoreWithoutSpecialComment()
+		}
+
+		if err != nil {
+			return err
 		}
 	case AlterTablePartitionAttributes:
 		ctx.WriteKeyWord("PARTITION ")
@@ -2838,6 +3527,18 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 			}
 			ctx.WriteName(name.O)
 		}
+	case AlterTableReorganizeLastPartition:
+		ctx.WriteKeyWord("SPLIT MAXVALUE PARTITION LESS THAN (")
+		if err := n.Partition.PartitionMethod.Expr.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore AlterTableReorganizeLastPartition Exprs")
+		}
+		ctx.WriteKeyWord(")")
+	case AlterTableReorganizeFirstPartition:
+		ctx.WriteKeyWord("MERGE FIRST PARTITION LESS THAN (")
+		if err := n.Partition.PartitionMethod.Expr.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore AlterTableReorganizeLastPartition Exprs")
+		}
+		ctx.WriteKeyWord(")")
 	case AlterTableReorganizePartition:
 		ctx.WriteKeyWord("REORGANIZE PARTITION")
 		if n.NoWriteToBinlog {
@@ -2902,22 +3603,25 @@ func (n *AlterTableSpec) Restore(ctx *format.RestoreCtx) error {
 		case IndexVisibilityInvisible:
 			ctx.WriteKeyWord(" INVISIBLE")
 		}
-	case AlterTablePlacement:
-		for i, spec := range n.PlacementSpecs {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			if err := spec.Restore(ctx); err != nil {
-				return errors.Annotatef(err, "An error occurred while restore AlterTableSpec.PlacementSpecs[%d]", i)
-			}
-		}
 	case AlterTableAttributes:
 		spec := n.AttributesSpec
 		if err := spec.Restore(ctx); err != nil {
 			return errors.Annotatef(err, "An error occurred while restore AlterTableSpec.AttributesSpec")
 		}
-	case AlterTableDropTableGroup:
-		ctx.WriteKeyWord("DROP TABLEGROUP")
+	case AlterTableCache:
+		ctx.WriteKeyWord("CACHE")
+	case AlterTableNoCache:
+		ctx.WriteKeyWord("NOCACHE")
+	case AlterTableStatsOptions:
+		spec := n.StatsOptionsSpec
+		if err := spec.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while restore AlterTableSpec.StatsOptionsSpec")
+		}
+	case AlterTableRemoveTTL:
+		_ = ctx.WriteWithSpecialComments(tidb.FeatureIDTTL, func() error {
+			ctx.WriteKeyWord("REMOVE TTL")
+			return nil
+		})
 	default:
 		// TODO: not support
 		ctx.WritePlainf(" /* AlterTableType(%d) is not supported */ ", n.Tp)
@@ -2981,45 +3685,18 @@ func (n *AlterTableSpec) Accept(v Visitor) (Node, bool) {
 		}
 		n.Partition = node.(*PartitionOptions)
 	}
+	for i, option := range n.Options {
+		node, ok := option.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Options[i] = node.(*TableOption)
+	}
 	for _, def := range n.PartDefinitions {
 		if !def.acceptInPlace(v) {
 			return n, false
 		}
 	}
-	for i, spec := range n.PlacementSpecs {
-		node, ok := spec.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.PlacementSpecs[i] = node.(*PlacementSpec)
-	}
-	return v.Leave(n)
-}
-
-type AttributesSpec struct {
-	node
-
-	Attributes string
-	Default    bool
-}
-
-func (n *AttributesSpec) Restore(ctx *format.RestoreCtx) error {
-	ctx.WriteKeyWord("ATTRIBUTES")
-	ctx.WritePlain("=")
-	if n.Default {
-		ctx.WriteKeyWord("DEFAULT")
-		return nil
-	}
-	ctx.WriteString(n.Attributes)
-	return nil
-}
-
-func (n *AttributesSpec) Accept(v Visitor) (Node, bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-	n = newNode.(*AttributesSpec)
 	return v.Leave(n)
 }
 
@@ -3032,14 +3709,45 @@ type AlterTableStmt struct {
 	Specs []*AlterTableSpec
 }
 
+func (n *AlterTableStmt) HaveOnlyPlacementOptions() bool {
+	for _, n := range n.Specs {
+		if n.Tp != AlterTablePartitionOptions {
+			return false
+		}
+		if !n.IsAllPlacementRule() {
+			return false
+		}
+	}
+	return true
+}
+
 // Restore implements Node interface.
-func (n *AlterTableStmt) Restore(ctx *RestoreCtx) error {
+func (n *AlterTableStmt) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasSkipPlacementRuleForRestoreFlag() && n.HaveOnlyPlacementOptions() {
+		return nil
+	}
 	ctx.WriteKeyWord("ALTER TABLE ")
 	if err := n.Table.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore AlterTableStmt.Table")
 	}
-	for i, spec := range n.Specs {
-		if i == 0 || spec.Tp == AlterTablePartition {
+	specs := make([]*AlterTableSpec, 0, len(n.Specs))
+	for _, spec := range n.Specs {
+		if spec.IsAllPlacementRule() && ctx.Flags.HasSkipPlacementRuleForRestoreFlag() {
+			continue
+		}
+		if spec.Tp == AlterTableOption {
+			newOptions := tableOptionsWithRestoreTTLFlag(ctx.Flags, spec.Options)
+			if len(newOptions) == 0 {
+				continue
+			}
+			newSpec := *spec
+			newSpec.Options = newOptions
+			spec = &newSpec
+		}
+		specs = append(specs, spec)
+	}
+	for i, spec := range specs {
+		if i == 0 || spec.Tp == AlterTablePartition || spec.Tp == AlterTableRemovePartitioning || spec.Tp == AlterTableImportTablespace || spec.Tp == AlterTableDiscardTablespace {
 			ctx.WritePlain(" ")
 		} else {
 			ctx.WritePlain(", ")
@@ -3073,188 +3781,6 @@ func (n *AlterTableStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// AlterTableGroupStmt is a statement to change the structure of a table group.
-type AlterTableGroupStmt struct {
-	ddlNode
-
-	TableGroup *TableGroupName
-	Spec       *AlterTableGroupSpec
-}
-
-// Restore implements Node interface.
-func (n *AlterTableGroupStmt) Restore(ctx *RestoreCtx) error {
-	ctx.WriteKeyWord("ALTER TABLEGROUP ")
-	if err := n.TableGroup.Restore(ctx); err != nil {
-		return errors.Annotate(err, "An error occurred while restore AlterTableGroupStmt.TableGroup")
-	}
-	ctx.WritePlain(" ")
-	if err := n.Spec.Restore(ctx); err != nil {
-		return errors.Annotate(err, "An error occurred while restore AlterTableGroupStmt.Spec")
-	}
-	return nil
-}
-
-// Accept implements Node Accept interface.
-func (n *AlterTableGroupStmt) Accept(v Visitor) (node Node, ok bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-	if n.TableGroup != nil {
-		node, ok := n.TableGroup.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.TableGroup = node.(*TableGroupName)
-	}
-	if n.Spec != nil {
-		node, ok := n.Spec.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Spec = node.(*AlterTableGroupSpec)
-	}
-	return v.Leave(n)
-}
-
-// AlterTableGroupSpec represents alter table group specification.
-type AlterTableGroupSpec struct {
-	node
-
-	Tp             AlterTableGroupType
-	Tables         []*TableName
-	Options        []*TableGroupOption
-	Partition      *TableGroupPartitionOption
-	PartitionNames []model.CIStr
-}
-
-// Restore implements Node interface.
-func (n *AlterTableGroupSpec) Restore(ctx *format.RestoreCtx) error {
-	switch n.Tp {
-	case AlterTableGroupTypeAddTable:
-		ctx.WriteKeyWord("ADD TABLE ")
-		for i, table := range n.Tables {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			ctx.WriteString(table.Name.O)
-		}
-	case AlterTableGroupTypeSetOption:
-		ctx.WriteKeyWord("SET ")
-		for i, option := range n.Options {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			if err := option.Restore(ctx); err != nil {
-				return errors.Annotatef(err, "An error occurred while restore AlterTableGroupSpec.Options: [%v]", i)
-			}
-		}
-	case AlterTableGroupTypeSetPartition:
-		if err := n.Partition.Restore(ctx); err != nil {
-			return errors.Annotate(err, "An error occurred while restore AlterTableGroupSpec.Partition")
-		}
-	case AlterTableGroupTypeDropPartition:
-		ctx.WriteKeyWord("DROP PARTITION ")
-		for i, name := range n.PartitionNames {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			ctx.WritePlain(name.O)
-		}
-	case AlterTableGroupTypeDropSubPartition:
-		ctx.WriteKeyWord("DROP SUBPARTITION ")
-		for i, name := range n.PartitionNames {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			ctx.WritePlain(name.O)
-		}
-	case AlterTableGroupTypeAddPartition:
-		ctx.WriteKeyWord("ADD PARTITION (")
-		for i, definition := range n.Partition.Definitions {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			if err := definition.Restore(ctx); err != nil {
-				return errors.Annotatef(err, "An error occurred while restore AlterTableGroupSpec.Partition.Definitions: [%v]", i)
-			}
-			ctx.WriteKeyWord(")")
-		}
-	case AlterTableGroupTypeReorganizePartition:
-		ctx.WriteKeyWord("REORGANIZE PARTITION ")
-		for i, name := range n.PartitionNames {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			ctx.WritePlain(name.O)
-		}
-		ctx.WriteKeyWord(" INTO (")
-		for i, definition := range n.Partition.Definitions {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			if err := definition.Restore(ctx); err != nil {
-				return errors.Annotatef(err, "An error occurred while restore AlterTableGroupSpec.Partition.Definitions: [%v]", i)
-			}
-			ctx.WriteKeyWord(")")
-		}
-	case AlterTableGroupTypeTruncatePartition:
-		ctx.WriteKeyWord("TRUNCATE PARTITION ")
-		for i, name := range n.PartitionNames {
-			if i != 0 {
-				ctx.WritePlain(", ")
-			}
-			ctx.WritePlain(name.O)
-		}
-	}
-	return nil
-}
-
-// Accept implements Node Accept interface.
-func (n *AlterTableGroupSpec) Accept(v Visitor) (Node, bool) {
-	newNode, skipChildren := v.Enter(n)
-	if skipChildren {
-		return v.Leave(newNode)
-	}
-	n = newNode.(*AlterTableGroupSpec)
-	for i, table := range n.Tables {
-		node, ok := table.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Tables[i] = node.(*TableName)
-	}
-	for i, option := range n.Options {
-		node, ok := option.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Options[i] = node.(*TableGroupOption)
-	}
-	if n.Partition != nil && n.Partition.PartitionMethod != nil {
-		node, ok := n.Partition.Accept(v)
-		if !ok {
-			return n, false
-		}
-		n.Partition = node.(*TableGroupPartitionOption)
-	}
-	return v.Leave(n)
-}
-
-// AlterTableGroupType is the type for AlterTableGroupStmt.
-type AlterTableGroupType int
-
-const (
-	AlterTableGroupTypeAddTable = iota
-	AlterTableGroupTypeSetOption
-	AlterTableGroupTypeSetPartition
-	AlterTableGroupTypeDropPartition
-	AlterTableGroupTypeDropSubPartition
-	AlterTableGroupTypeAddPartition
-	AlterTableGroupTypeReorganizePartition
-	AlterTableGroupTypeTruncatePartition
-)
-
 // TruncateTableStmt is a statement to empty a table completely.
 // See https://dev.mysql.com/doc/refman/5.7/en/truncate-table.html
 type TruncateTableStmt struct {
@@ -3264,7 +3790,7 @@ type TruncateTableStmt struct {
 }
 
 // Restore implements Node interface.
-func (n *TruncateTableStmt) Restore(ctx *RestoreCtx) error {
+func (n *TruncateTableStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("TRUNCATE TABLE ")
 	if err := n.Table.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore TruncateTableStmt.Table")
@@ -3300,6 +3826,9 @@ var (
 	ErrSystemVersioningWrongPartitions      = terror.ClassDDL.NewStd(mysql.ErrSystemVersioningWrongPartitions)
 	ErrTooManyValues                        = terror.ClassDDL.NewStd(mysql.ErrTooManyValues)
 	ErrWrongPartitionTypeExpectedSystemTime = terror.ClassDDL.NewStd(mysql.ErrWrongPartitionTypeExpectedSystemTime)
+	ErrUnknownCharacterSet                  = terror.ClassDDL.NewStd(mysql.ErrUnknownCharacterSet)
+	ErrCoalescePartitionNoPartition         = terror.ClassDDL.NewStd(mysql.ErrCoalescePartitionNoPartition)
+	ErrWrongUsage                           = terror.ClassDDL.NewStd(mysql.ErrWrongUsage)
 )
 
 type SubPartitionDefinition struct {
@@ -3307,7 +3836,7 @@ type SubPartitionDefinition struct {
 	Options []*TableOption
 }
 
-func (spd *SubPartitionDefinition) Restore(ctx *RestoreCtx) error {
+func (spd *SubPartitionDefinition) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("SUBPARTITION ")
 	ctx.WriteName(spd.Name.O)
 	for i, opt := range spd.Options {
@@ -3320,7 +3849,7 @@ func (spd *SubPartitionDefinition) Restore(ctx *RestoreCtx) error {
 }
 
 type PartitionDefinitionClause interface {
-	restore(ctx *RestoreCtx) error
+	restore(ctx *format.RestoreCtx) error
 	acceptInPlace(v Visitor) bool
 	// Validate checks if the clause is consistent with the given options.
 	// `pt` can be 0 and `columns` can be -1 to skip checking the clause against
@@ -3330,15 +3859,15 @@ type PartitionDefinitionClause interface {
 
 type PartitionDefinitionClauseNone struct{}
 
-func (n *PartitionDefinitionClauseNone) restore(ctx *RestoreCtx) error {
+func (*PartitionDefinitionClauseNone) restore(_ *format.RestoreCtx) error {
 	return nil
 }
 
-func (n *PartitionDefinitionClauseNone) acceptInPlace(v Visitor) bool {
+func (*PartitionDefinitionClauseNone) acceptInPlace(_ Visitor) bool {
 	return true
 }
 
-func (n *PartitionDefinitionClauseNone) Validate(pt model.PartitionType, columns int) error {
+func (*PartitionDefinitionClauseNone) Validate(pt model.PartitionType, _ int) error {
 	switch pt {
 	case 0:
 	case model.PartitionTypeRange:
@@ -3355,7 +3884,7 @@ type PartitionDefinitionClauseLessThan struct {
 	Exprs []ExprNode
 }
 
-func (n *PartitionDefinitionClauseLessThan) restore(ctx *RestoreCtx) error {
+func (n *PartitionDefinitionClauseLessThan) restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord(" VALUES LESS THAN ")
 	ctx.WritePlain("(")
 	for i, expr := range n.Exprs {
@@ -3401,11 +3930,17 @@ type PartitionDefinitionClauseIn struct {
 	Values [][]ExprNode
 }
 
-func (n *PartitionDefinitionClauseIn) restore(ctx *RestoreCtx) error {
+func (n *PartitionDefinitionClauseIn) restore(ctx *format.RestoreCtx) error {
 	// we special-case an empty list of values to mean MariaDB's "DEFAULT" clause.
 	if len(n.Values) == 0 {
 		ctx.WriteKeyWord(" DEFAULT")
 		return nil
+	}
+	if len(n.Values) == 1 && len(n.Values[0]) == 1 {
+		if _, ok := n.Values[0][0].(*DefaultExpr); ok {
+			ctx.WriteKeyWord(" DEFAULT")
+			return nil
+		}
 	}
 
 	ctx.WriteKeyWord(" VALUES IN ")
@@ -3459,9 +3994,23 @@ func (n *PartitionDefinitionClauseIn) Validate(pt model.PartitionType, columns i
 		return nil
 	}
 
+	nextIdx := 1
 	expectedColCount := len(n.Values[0])
-	for _, val := range n.Values[1:] {
+	// OK if one of the n.Values is DefaultExpr as only value
+	if expectedColCount == 1 {
+		if _, ok := n.Values[0][0].(*DefaultExpr); ok {
+			// Only DEFAULT in the partition definition, OK
+			if len(n.Values) > 1 {
+				expectedColCount = len(n.Values[1])
+				nextIdx++
+			}
+		}
+	}
+	for _, val := range n.Values[nextIdx:] {
 		if len(val) != expectedColCount {
+			if _, ok := val[0].(*DefaultExpr); ok && len(val) == 1 {
+				continue
+			}
 			return ErrPartitionColumnList
 		}
 	}
@@ -3470,6 +4019,12 @@ func (n *PartitionDefinitionClauseIn) Validate(pt model.PartitionType, columns i
 	case columns == 0 && expectedColCount != 1:
 		return ErrRowSinglePartitionField
 	case columns > 0 && expectedColCount != columns:
+		if len(n.Values) == 1 && expectedColCount == 1 {
+			if _, ok := n.Values[0][0].(*DefaultExpr); ok {
+				// Only one value, which is DEFAULT, which is OK
+				return nil
+			}
+		}
 		return ErrPartitionColumnList
 	}
 	return nil
@@ -3479,7 +4034,7 @@ type PartitionDefinitionClauseHistory struct {
 	Current bool
 }
 
-func (n *PartitionDefinitionClauseHistory) restore(ctx *RestoreCtx) error {
+func (n *PartitionDefinitionClauseHistory) restore(ctx *format.RestoreCtx) error {
 	if n.Current {
 		ctx.WriteKeyWord(" CURRENT")
 	} else {
@@ -3488,11 +4043,11 @@ func (n *PartitionDefinitionClauseHistory) restore(ctx *RestoreCtx) error {
 	return nil
 }
 
-func (n *PartitionDefinitionClauseHistory) acceptInPlace(v Visitor) bool {
+func (*PartitionDefinitionClauseHistory) acceptInPlace(_ Visitor) bool {
 	return true
 }
 
-func (n *PartitionDefinitionClauseHistory) Validate(pt model.PartitionType, columns int) error {
+func (*PartitionDefinitionClauseHistory) Validate(pt model.PartitionType, _ int) error {
 	switch pt {
 	case 0, model.PartitionTypeSystemTime:
 	default:
@@ -3526,7 +4081,7 @@ func (n *PartitionDefinition) acceptInPlace(v Visitor) bool {
 }
 
 // Restore implements Node interface.
-func (n *PartitionDefinition) Restore(ctx *RestoreCtx) error {
+func (n *PartitionDefinition) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("PARTITION ")
 	ctx.WriteName(n.Name.O)
 
@@ -3557,51 +4112,81 @@ func (n *PartitionDefinition) Restore(ctx *RestoreCtx) error {
 	return nil
 }
 
+type PartitionIntervalExpr struct {
+	Expr ExprNode
+	// TimeUnitInvalid if not Time based INTERVAL!
+	TimeUnit TimeUnitType
+}
+
+type PartitionInterval struct {
+	// To be able to get original text and replace the syntactic sugar with generated
+	// partition definitions
+	node
+	IntervalExpr  PartitionIntervalExpr
+	FirstRangeEnd *ExprNode
+	LastRangeEnd  *ExprNode
+	MaxValPart    bool
+	NullPart      bool
+}
+
 // PartitionMethod describes how partitions or subpartitions are constructed.
 type PartitionMethod struct {
+	// To be able to get original text and replace the syntactic sugar with generated
+	// partition definitions
+	node
 	// Tp is the type of the partition function
 	Tp model.PartitionType
 	// Linear is a modifier to the HASH and KEY type for choosing a different
 	// algorithm
 	Linear bool
-	// Expr is an expression used as argument of HASH, RANGE, LIST and
-	// SYSTEM_TIME types
+	// Expr is an expression used as argument of HASH, RANGE AND LIST types
 	Expr ExprNode
 	// ColumnNames is a list of column names used as argument of KEY,
 	// RANGE COLUMNS and LIST COLUMNS types
 	ColumnNames []*ColumnName
 	// Unit is a time unit used as argument of SYSTEM_TIME type
-	Unit *ValueExpr
+	Unit TimeUnitType
 	// Limit is a row count used as argument of the SYSTEM_TIME type
 	Limit uint64
 
 	// Num is the number of (sub)partitions required by the method.
 	Num uint64
+
+	// KeyAlgorithm is the optional hash algorithm type for `PARTITION BY [LINEAR] KEY` syntax.
+	KeyAlgorithm *PartitionKeyAlgorithm
+
+	Interval *PartitionInterval
+}
+
+type PartitionKeyAlgorithm struct {
+	Type uint64
 }
 
 // Restore implements the Node interface
-func (n *PartitionMethod) Restore(ctx *RestoreCtx) error {
+func (n *PartitionMethod) Restore(ctx *format.RestoreCtx) error {
 	if n.Linear {
 		ctx.WriteKeyWord("LINEAR ")
 	}
 	ctx.WriteKeyWord(n.Tp.String())
 
+	if n.KeyAlgorithm != nil {
+		ctx.WriteKeyWord(" ALGORITHM")
+		ctx.WritePlainf(" = %d", n.KeyAlgorithm.Type)
+	}
+
 	switch {
 	case n.Tp == model.PartitionTypeSystemTime:
-		if n.Expr != nil && n.Unit != nil {
+		if n.Expr != nil && n.Unit != TimeUnitInvalid {
 			ctx.WriteKeyWord(" INTERVAL ")
 			if err := n.Expr.Restore(ctx); err != nil {
 				return errors.Annotate(err, "An error occurred while restore PartitionMethod.Expr")
 			}
-
-			// Here the Unit string should not be quoted.
-			// TODO: This is a temporary workaround that should be changed once something like "Keyword Expression" is implemented.
-			var sb strings.Builder
-			if err := n.Unit.Restore(NewRestoreCtx(0, &sb)); err != nil {
-				return errors.Annotate(err, "An error occurred while restore PartitionMethod.Unit")
-			}
 			ctx.WritePlain(" ")
-			ctx.WriteKeyWord(sb.String())
+			ctx.WriteKeyWord(n.Unit.String())
+		}
+		if n.Limit > 0 {
+			ctx.WriteKeyWord(" LIMIT ")
+			ctx.WritePlainf("%d", n.Limit)
 		}
 
 	case n.Expr != nil:
@@ -3627,9 +4212,30 @@ func (n *PartitionMethod) Restore(ctx *RestoreCtx) error {
 		ctx.WritePlain(")")
 	}
 
-	if n.Limit > 0 {
-		ctx.WriteKeyWord(" LIMIT ")
-		ctx.WritePlainf("%d", n.Limit)
+	if n.Interval != nil {
+		ctx.WritePlain(" INTERVAL (")
+		n.Interval.IntervalExpr.Expr.Restore(ctx)
+		if n.Interval.IntervalExpr.TimeUnit != TimeUnitInvalid {
+			ctx.WritePlain(" ")
+			ctx.WriteKeyWord(n.Interval.IntervalExpr.TimeUnit.String())
+		}
+		ctx.WritePlain(")")
+		if n.Interval.FirstRangeEnd != nil {
+			ctx.WritePlain(" FIRST PARTITION LESS THAN (")
+			(*n.Interval.FirstRangeEnd).Restore(ctx)
+			ctx.WritePlain(")")
+		}
+		if n.Interval.LastRangeEnd != nil {
+			ctx.WritePlain(" LAST PARTITION LESS THAN (")
+			(*n.Interval.LastRangeEnd).Restore(ctx)
+			ctx.WritePlain(")")
+		}
+		if n.Interval.NullPart {
+			ctx.WritePlain(" NULL PARTITION")
+		}
+		if n.Interval.MaxValPart {
+			ctx.WritePlain(" MAXVALUE PARTITION")
+		}
 	}
 
 	return nil
@@ -3651,19 +4257,11 @@ func (n *PartitionMethod) acceptInPlace(v Visitor) bool {
 		}
 		n.ColumnNames[i] = newColName.(*ColumnName)
 	}
-	if n.Unit != nil {
-		unit, ok := n.Unit.Accept(v)
-		if !ok {
-			return false
-		}
-		n.Unit = unit.(*ValueExpr)
-	}
 	return true
 }
 
 // PartitionOptions specifies the partition options.
 type PartitionOptions struct {
-	node
 	PartitionMethod
 	Sub         *PartitionMethod
 	Definitions []*PartitionDefinition
@@ -3705,7 +4303,7 @@ func (n *PartitionOptions) Validate() error {
 			n.Num = 1
 		}
 	case model.PartitionTypeRange, model.PartitionTypeList:
-		if len(n.Definitions) == 0 {
+		if n.Interval == nil && len(n.Definitions) == 0 {
 			return ErrPartitionsMustBeDefined.GenWithStackByArgs(n.Tp)
 		}
 	case model.PartitionTypeSystemTime:
@@ -3725,7 +4323,7 @@ func (n *PartitionOptions) Validate() error {
 	return nil
 }
 
-func (n *PartitionOptions) Restore(ctx *RestoreCtx) error {
+func (n *PartitionOptions) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("PARTITION BY ")
 	if err := n.PartitionMethod.Restore(ctx); err != nil {
 		return errors.Annotate(err, "An error occurred while restore PartitionOptions.PartitionMethod")
@@ -3794,18 +4392,18 @@ type RecoverTableStmt struct {
 }
 
 // Restore implements Node interface.
-func (n *RecoverTableStmt) Restore(ctx *RestoreCtx) error {
+func (n *RecoverTableStmt) Restore(ctx *format.RestoreCtx) error {
 	ctx.WriteKeyWord("RECOVER TABLE ")
-	if n.JobID != 0 {
-		ctx.WriteKeyWord("BY JOB ")
-		ctx.WritePlainf("%d", n.JobID)
-	} else {
+	if n.Table != nil {
 		if err := n.Table.Restore(ctx); err != nil {
 			return errors.Annotate(err, "An error occurred while splicing RecoverTableStmt Table")
 		}
 		if n.JobNum > 0 {
 			ctx.WritePlainf(" %d", n.JobNum)
 		}
+	} else {
+		ctx.WriteKeyWord("BY JOB ")
+		ctx.WritePlainf("%d", n.JobID)
 	}
 	return nil
 }
@@ -3828,85 +4426,342 @@ func (n *RecoverTableStmt) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-type PlacementActionType int
+// FlashBackToTimestampStmt is a statement to restore the cluster to the specified timestamp
+type FlashBackToTimestampStmt struct {
+	ddlNode
 
-const (
-	PlacementAdd PlacementActionType = iota + 1
-	PlacementAlter
-	PlacementDrop
-)
-
-type PlacementRole int
-
-const (
-	PlacementRoleNone PlacementRole = iota
-	PlacementRoleLeader
-	PlacementRoleFollower
-	PlacementRoleLearner
-	PlacementRoleVoter
-)
-
-type PlacementSpec struct {
-	node
-
-	Tp          PlacementActionType
-	Constraints string
-	Role        PlacementRole
-	Replicas    uint64
+	FlashbackTS ExprNode
+	Tables      []*TableName
+	DBName      model.CIStr
 }
 
-func (n *PlacementSpec) restoreRole(ctx *format.RestoreCtx) error {
-	ctx.WriteKeyWord(" ROLE")
-	ctx.WritePlain("=")
-	switch n.Role {
-	case PlacementRoleFollower:
-		ctx.WriteKeyWord("FOLLOWER")
-	case PlacementRoleLeader:
-		ctx.WriteKeyWord("LEADER")
-	case PlacementRoleLearner:
-		ctx.WriteKeyWord("LEARNER")
-	case PlacementRoleVoter:
-		ctx.WriteKeyWord("VOTER")
-	default:
-		return errors.Errorf("invalid PlacementRole: %d", n.Role)
-	}
-	return nil
-}
-
-func (n *PlacementSpec) Restore(ctx *format.RestoreCtx) error {
-	switch n.Tp {
-	case PlacementAdd:
-		ctx.WriteKeyWord("ADD PLACEMENT POLICY ")
-	case PlacementAlter:
-		ctx.WriteKeyWord("ALTER PLACEMENT POLICY ")
-	case PlacementDrop:
-		ctx.WriteKeyWord("DROP PLACEMENT POLICY")
-		if n.Role != PlacementRoleNone {
-			return n.restoreRole(ctx)
+// Restore implements Node interface
+func (n *FlashBackToTimestampStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("FLASHBACK ")
+	if len(n.Tables) != 0 {
+		ctx.WriteKeyWord("TABLE ")
+		for index, table := range n.Tables {
+			if index != 0 {
+				ctx.WritePlain(", ")
+			}
+			if err := table.Restore(ctx); err != nil {
+				return errors.Annotatef(err, "An error occurred while restore DropTableStmt.Tables[%d]", index)
+			}
 		}
-		return nil
-	default:
-		return errors.Errorf("invalid PlacementActionType: %d", n.Tp)
+	} else if n.DBName.O != "" {
+		ctx.WriteKeyWord("DATABASE ")
+		ctx.WriteName(n.DBName.O)
+	} else {
+		ctx.WriteKeyWord("CLUSTER")
 	}
-
-	ctx.WriteKeyWord("CONSTRAINTS")
-	ctx.WritePlain("=")
-	ctx.WriteString(n.Constraints)
-
-	if err := n.restoreRole(ctx); err != nil {
-		return err
+	ctx.WriteKeyWord(" TO TIMESTAMP ")
+	if err := n.FlashbackTS.Restore(ctx); err != nil {
+		return errors.Annotate(err, "An error occurred while splicing FlashBackToTimestampStmt.FlashbackTS")
 	}
-
-	ctx.WriteKeyWord(" REPLICAS")
-	ctx.WritePlainf("=%d", n.Replicas)
 	return nil
 }
 
-func (n *PlacementSpec) Accept(v Visitor) (Node, bool) {
+// Accept implements Node Accept interface.
+func (n *FlashBackToTimestampStmt) Accept(v Visitor) (Node, bool) {
 	newNode, skipChildren := v.Enter(n)
 	if skipChildren {
 		return v.Leave(newNode)
 	}
-	n = newNode.(*PlacementSpec)
+	n = newNode.(*FlashBackToTimestampStmt)
+	if len(n.Tables) != 0 {
+		for i, val := range n.Tables {
+			node, ok := val.Accept(v)
+			if !ok {
+				return n, false
+			}
+			n.Tables[i] = node.(*TableName)
+		}
+	}
+	node, ok := n.FlashbackTS.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.FlashbackTS = node.(ExprNode)
 	return v.Leave(n)
+}
+
+// FlashBackTableStmt is a statement to restore a dropped/truncate table.
+type FlashBackTableStmt struct {
+	ddlNode
+
+	Table   *TableName
+	NewName string
+}
+
+// Restore implements Node interface.
+func (n *FlashBackTableStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("FLASHBACK TABLE ")
+	if err := n.Table.Restore(ctx); err != nil {
+		return errors.Annotate(err, "An error occurred while splicing RecoverTableStmt Table")
+	}
+	if len(n.NewName) > 0 {
+		ctx.WriteKeyWord(" TO ")
+		ctx.WriteName(n.NewName)
+	}
+	return nil
+}
+
+// Accept implements Node Accept interface.
+func (n *FlashBackTableStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+
+	n = newNode.(*FlashBackTableStmt)
+	if n.Table != nil {
+		node, ok := n.Table.Accept(v)
+		if !ok {
+			return n, false
+		}
+		n.Table = node.(*TableName)
+	}
+	return v.Leave(n)
+}
+
+type AttributesSpec struct {
+	node
+
+	Attributes string
+	Default    bool
+}
+
+func (n *AttributesSpec) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("ATTRIBUTES")
+	ctx.WritePlain("=")
+	if n.Default {
+		ctx.WriteKeyWord("DEFAULT")
+		return nil
+	}
+	ctx.WriteString(n.Attributes)
+	return nil
+}
+
+func (n *AttributesSpec) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AttributesSpec)
+	return v.Leave(n)
+}
+
+type StatsOptionsSpec struct {
+	node
+
+	StatsOptions string
+	Default      bool
+}
+
+func (n *StatsOptionsSpec) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("STATS_OPTIONS")
+	ctx.WritePlain("=")
+	if n.Default {
+		ctx.WriteKeyWord("DEFAULT")
+		return nil
+	}
+	ctx.WriteString(n.StatsOptions)
+	return nil
+}
+
+func (n *StatsOptionsSpec) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*StatsOptionsSpec)
+	return v.Leave(n)
+}
+
+// AlterPlacementPolicyStmt is a statement to alter placement policy option.
+type AlterPlacementPolicyStmt struct {
+	ddlNode
+
+	PolicyName       model.CIStr
+	IfExists         bool
+	PlacementOptions []*PlacementOption
+}
+
+func (n *AlterPlacementPolicyStmt) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasSkipPlacementRuleForRestoreFlag() {
+		return nil
+	}
+	if ctx.Flags.HasTiDBSpecialCommentFlag() {
+		return restorePlacementStmtInSpecialComment(ctx, n)
+	}
+
+	ctx.WriteKeyWord("ALTER PLACEMENT POLICY ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	ctx.WriteName(n.PolicyName.O)
+	for i, option := range n.PlacementOptions {
+		ctx.WritePlain(" ")
+		if err := option.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while splicing AlterPlacementPolicyStmt TableOption: [%v]", i)
+		}
+	}
+	return nil
+}
+
+func (n *AlterPlacementPolicyStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterPlacementPolicyStmt)
+	return v.Leave(n)
+}
+
+func CheckAppend(ops []*ResourceGroupOption, newOp *ResourceGroupOption) bool {
+	for _, op := range ops {
+		if op.Tp == newOp.Tp {
+			return false
+		}
+	}
+	return true
+}
+
+func CheckRunawayAppend(ops []*ResourceGroupRunawayOption, newOp *ResourceGroupRunawayOption) bool {
+	for _, op := range ops {
+		if op.Tp == newOp.Tp {
+			return false
+		}
+	}
+	return true
+}
+
+func CheckBackgroundAppend(ops []*ResourceGroupBackgroundOption, newOp *ResourceGroupBackgroundOption) bool {
+	for _, op := range ops {
+		if op.Type == newOp.Type {
+			return false
+		}
+	}
+	return true
+}
+
+// AlterResourceGroupStmt is a statement to alter placement policy option.
+type AlterResourceGroupStmt struct {
+	ddlNode
+
+	ResourceGroupName       model.CIStr
+	IfExists                bool
+	ResourceGroupOptionList []*ResourceGroupOption
+}
+
+func (n *AlterResourceGroupStmt) Restore(ctx *format.RestoreCtx) error {
+	if ctx.Flags.HasTiDBSpecialCommentFlag() {
+		return restoreStmtInSpecialComment(ctx, n, tidb.FeatureIDResourceGroup)
+	}
+
+	ctx.WriteKeyWord("ALTER RESOURCE GROUP ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	ctx.WriteName(n.ResourceGroupName.O)
+	for i, option := range n.ResourceGroupOptionList {
+		if i > 0 {
+			ctx.WritePlain(",")
+		}
+		ctx.WritePlain(" ")
+		if err := option.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while splicing AlterResourceGroupStmt Options: [%v]", i)
+		}
+	}
+	return nil
+}
+
+func (n *AlterResourceGroupStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterResourceGroupStmt)
+	return v.Leave(n)
+}
+
+// AlterSequenceStmt is a statement to alter sequence option.
+type AlterSequenceStmt struct {
+	ddlNode
+
+	// sequence name
+	Name *TableName
+
+	IfExists   bool
+	SeqOptions []*SequenceOption
+}
+
+func (n *AlterSequenceStmt) Restore(ctx *format.RestoreCtx) error {
+	ctx.WriteKeyWord("ALTER SEQUENCE ")
+	if n.IfExists {
+		ctx.WriteKeyWord("IF EXISTS ")
+	}
+	if err := n.Name.Restore(ctx); err != nil {
+		return errors.Annotate(err, "An error occurred while restore AlterSequenceStmt.Table")
+	}
+	for i, option := range n.SeqOptions {
+		ctx.WritePlain(" ")
+		if err := option.Restore(ctx); err != nil {
+			return errors.Annotatef(err, "An error occurred while splicing AlterSequenceStmt SequenceOption: [%v]", i)
+		}
+	}
+	return nil
+}
+
+func (n *AlterSequenceStmt) Accept(v Visitor) (Node, bool) {
+	newNode, skipChildren := v.Enter(n)
+	if skipChildren {
+		return v.Leave(newNode)
+	}
+	n = newNode.(*AlterSequenceStmt)
+	node, ok := n.Name.Accept(v)
+	if !ok {
+		return n, false
+	}
+	n.Name = node.(*TableName)
+	return v.Leave(n)
+}
+
+func restorePlacementStmtInSpecialComment(ctx *format.RestoreCtx, n DDLNode) error {
+	return restoreStmtInSpecialComment(ctx, n, tidb.FeatureIDPlacement)
+}
+
+func restoreStmtInSpecialComment(ctx *format.RestoreCtx, n DDLNode, feature string) error {
+	origFlags := ctx.Flags
+	defer func() {
+		ctx.Flags = origFlags
+	}()
+
+	ctx.Flags |= format.RestoreTiDBSpecialComment
+	return ctx.WriteWithSpecialComments(feature, func() error {
+		ctx.Flags &= ^format.RestoreTiDBSpecialComment
+		return n.Restore(ctx)
+	})
+}
+
+func tableOptionsWithRestoreTTLFlag(flags format.RestoreFlags, options []*TableOption) []*TableOption {
+	if !flags.HasRestoreWithTTLEnableOff() {
+		return options
+	}
+
+	newOptions := make([]*TableOption, 0, len(options))
+	for _, opt := range options {
+		if opt.Tp == TableOptionTTLEnable {
+			continue
+		}
+
+		newOptions = append(newOptions, opt)
+		if opt.Tp == TableOptionTTL {
+			newOptions = append(newOptions, &TableOption{
+				Tp:        TableOptionTTLEnable,
+				BoolValue: false,
+			})
+		}
+	}
+	return newOptions
 }

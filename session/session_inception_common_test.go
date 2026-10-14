@@ -800,9 +800,12 @@ func getLeftTable(node ast.ResultSetNode) *ast.TableSource {
 		if x.From != nil {
 			return getLeftTable(x.From.TableRefs)
 		}
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		for _, sel := range x.SelectList.Selects {
-			return getLeftTable(sel)
+			if resultSet, ok := sel.(ast.ResultSetNode); ok {
+				return getLeftTable(resultSet)
+			}
+			return nil
 		}
 	}
 	return nil
@@ -881,7 +884,9 @@ func (s *testCommon) getObjectName(sql string) (name string) {
 			}
 
 		case *ast.RenameTableStmt:
-			name = node.OldTable.Name.String()
+			if len(node.TableToTables) > 0 {
+				name = node.TableToTables[0].OldTable.Name.String()
+			}
 
 		case *ast.TruncateTableStmt:
 

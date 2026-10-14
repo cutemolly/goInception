@@ -189,7 +189,7 @@ func (s *testFieldTypeSuite) TestDefaultTypeForValue(c *C) {
 	}
 	for _, tt := range tests {
 		var ft FieldType
-		DefaultTypeForValue(tt.value, &ft)
+		DefaultTypeForValue(tt.value, &ft, "", "")
 		c.Assert(ft.Tp, Equals, tt.tp, Commentf("%v %v", ft.Tp, tt.tp))
 		c.Assert(ft.Flen, Equals, tt.flen, Commentf("%v %v", ft.Flen, tt.flen))
 		c.Assert(ft.Charset, Equals, tt.charset, Commentf("%v %v", ft.Charset, tt.charset))

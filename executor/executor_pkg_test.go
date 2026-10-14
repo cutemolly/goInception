@@ -221,10 +221,11 @@ func (s *testExecSuite) TestGetFieldsFromLine(c *C) {
 		},
 	}
 
+	enclosed, terminated := `"`, ","
 	ldInfo := LoadDataInfo{
 		FieldsInfo: &ast.FieldsClause{
-			Enclosed:   '"',
-			Terminated: ",",
+			Enclosed:   &enclosed,
+			Terminated: &terminated,
 		},
 	}
 

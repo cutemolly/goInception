@@ -38,11 +38,11 @@ func (user *UserIdentity) Restore(ctx *RestoreCtx) error {
 	if user.CurrentUser {
 		ctx.WriteKeyWord("CURRENT_USER")
 	} else {
+		// The hostname is written unconditionally, matching the upstream
+		// parser: an empty hostname still needs its `@''` to round-trip.
 		ctx.WriteName(user.Username)
-		if user.Hostname != "" {
-			ctx.WritePlain("@")
-			ctx.WriteName(user.Hostname)
-		}
+		ctx.WritePlain("@")
+		ctx.WriteName(user.Hostname)
 	}
 	return nil
 }

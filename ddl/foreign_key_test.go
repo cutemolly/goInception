@@ -17,7 +17,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hanchuanchuan/goInception/ast"
 	"github.com/hanchuanchuan/goInception/kv"
 	"github.com/hanchuanchuan/goInception/model"
 	"github.com/hanchuanchuan/goInception/sessionctx"
@@ -48,7 +47,7 @@ func (s *testForeighKeySuite) TearDownSuite(c *C) {
 	testleak.AfterTest(c)()
 }
 
-func (s *testForeighKeySuite) testCreateForeignKey(c *C, tblInfo *model.TableInfo, fkName string, keys []string, refTable string, refKeys []string, onDelete ast.ReferOptionType, onUpdate ast.ReferOptionType) *model.Job {
+func (s *testForeighKeySuite) testCreateForeignKey(c *C, tblInfo *model.TableInfo, fkName string, keys []string, refTable string, refKeys []string, onDelete model.ReferOptionType, onUpdate model.ReferOptionType) *model.Job {
 	FKName := model.NewCIStr(fkName)
 	Keys := make([]model.CIStr, len(keys))
 	for i, key := range keys {
@@ -158,7 +157,7 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	d.Stop()
 	d.start(context.Background(), nil)
 
-	job := s.testCreateForeignKey(c, tblInfo, "c1_fk", []string{"c1"}, "t2", []string{"c1"}, ast.ReferOptionCascade, ast.ReferOptionSetNull)
+	job := s.testCreateForeignKey(c, tblInfo, "c1_fk", []string{"c1"}, "t2", []string{"c1"}, model.ReferOptionCascade, model.ReferOptionSetNull)
 	testCheckJobDone(c, d, job, true)
 	err = ctx.Txn().Commit(context.Background())
 	c.Assert(err, IsNil)

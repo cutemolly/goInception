@@ -16,39 +16,95 @@ package ast_test
 import (
 	"fmt"
 	"strings"
+	"testing"
 
-	"github.com/hanchuanchuan/goInception/ast"
+	"github.com/hanchuanchuan/goInception/parser"
 	. "github.com/hanchuanchuan/goInception/ast"
 	. "github.com/hanchuanchuan/goInception/format"
-	"github.com/hanchuanchuan/goInception/parser"
-	// "github.com/hanchuanchuan/goInception/types/parser_driver"
-	. "github.com/pingcap/check"
+	"github.com/hanchuanchuan/goInception/mysql"
+	"github.com/hanchuanchuan/goInception/parser/test_driver"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Suite(&testCacheableSuite{})
-
-type testCacheableSuite struct {
-}
-
-func (s *testCacheableSuite) TestCacheable(c *C) {
+func TestCacheable(t *testing.T) {
 	// test non-SelectStmt
 	var stmt Node = &DeleteStmt{}
-	c.Assert(IsReadOnly(stmt), IsFalse)
+	require.False(t, IsReadOnly(stmt))
 
 	stmt = &InsertStmt{}
-	c.Assert(IsReadOnly(stmt), IsFalse)
+	require.False(t, IsReadOnly(stmt))
 
 	stmt = &UpdateStmt{}
-	c.Assert(IsReadOnly(stmt), IsFalse)
+	require.False(t, IsReadOnly(stmt))
 
 	stmt = &ExplainStmt{}
-	c.Assert(IsReadOnly(stmt), IsTrue)
+	require.True(t, IsReadOnly(stmt))
 
 	stmt = &ExplainStmt{}
-	c.Assert(IsReadOnly(stmt), IsTrue)
+	require.True(t, IsReadOnly(stmt))
 
 	stmt = &DoStmt{}
-	c.Assert(IsReadOnly(stmt), IsTrue)
+	require.True(t, IsReadOnly(stmt))
+
+	stmt = &ExplainStmt{
+		Stmt: &InsertStmt{},
+	}
+	require.True(t, IsReadOnly(stmt))
+
+	stmt = &ExplainStmt{
+		Analyze: true,
+		Stmt:    &InsertStmt{},
+	}
+	require.False(t, IsReadOnly(stmt))
+
+	stmt = &ExplainStmt{
+		Stmt: &SelectStmt{},
+	}
+	require.True(t, IsReadOnly(stmt))
+
+	stmt = &ExplainStmt{
+		Analyze: true,
+		Stmt:    &SelectStmt{},
+	}
+	require.True(t, IsReadOnly(stmt))
+
+	stmt = &ShowStmt{}
+	require.True(t, IsReadOnly(stmt))
+
+	stmt = &ShowStmt{}
+	require.True(t, IsReadOnly(stmt))
+}
+
+func TestUnionReadOnly(t *testing.T) {
+	selectReadOnly := &SelectStmt{}
+	selectForUpdate := &SelectStmt{
+		LockInfo: &SelectLockInfo{LockType: SelectLockForUpdate},
+	}
+	selectForUpdateNoWait := &SelectStmt{
+		LockInfo: &SelectLockInfo{LockType: SelectLockForUpdateNoWait},
+	}
+
+	setOprStmt := &SetOprStmt{
+		SelectList: &SetOprSelectList{
+			Selects: []Node{selectReadOnly, selectReadOnly},
+		},
+	}
+	require.True(t, IsReadOnly(setOprStmt))
+
+	setOprStmt.SelectList.Selects = []Node{selectReadOnly, selectReadOnly, selectReadOnly}
+	require.True(t, IsReadOnly(setOprStmt))
+
+	setOprStmt.SelectList.Selects = []Node{selectReadOnly, selectForUpdate}
+	require.False(t, IsReadOnly(setOprStmt))
+
+	setOprStmt.SelectList.Selects = []Node{selectReadOnly, selectForUpdateNoWait}
+	require.False(t, IsReadOnly(setOprStmt))
+
+	setOprStmt.SelectList.Selects = []Node{selectForUpdate, selectForUpdateNoWait}
+	require.False(t, IsReadOnly(setOprStmt))
+
+	setOprStmt.SelectList.Selects = []Node{selectReadOnly, selectForUpdate, selectForUpdateNoWait}
+	require.False(t, IsReadOnly(setOprStmt))
 }
 
 // CleanNodeText set the text of node and all child node empty.
@@ -65,7 +121,17 @@ type nodeTextCleaner struct {
 
 // Enter implements Visitor interface.
 func (checker *nodeTextCleaner) Enter(in Node) (out Node, skipChildren bool) {
-	in.SetText("")
+	in.SetText(nil, "")
+	in.SetOriginTextPosition(0)
+	if v, ok := in.(ValueExpr); ok && v != nil {
+		tpFlag := v.GetType().GetFlag()
+		if tpFlag&mysql.UnderScoreCharsetFlag != 0 {
+			// ignore underscore charset flag to let `'abc' = _utf8'abc'` pass
+			tpFlag ^= mysql.UnderScoreCharsetFlag
+			v.GetType().SetFlag(tpFlag)
+		}
+	}
+
 	switch node := in.(type) {
 	case *Constraint:
 		if node.Option != nil {
@@ -77,7 +143,7 @@ func (checker *nodeTextCleaner) Enter(in Node) (out Node, skipChildren bool) {
 		node.FnName.O = strings.ToLower(node.FnName.O)
 		switch node.FnName.L {
 		case "convert":
-			node.Args[1].(*ast.ValueExpr).Datum.SetBytes(nil)
+			node.Args[1].(*test_driver.ValueExpr).Datum.SetBytes(nil)
 		}
 	case *AggregateFuncExpr:
 		node.F = strings.ToLower(node.F)
@@ -89,6 +155,10 @@ func (checker *nodeTextCleaner) Enter(in Node) (out Node, skipChildren bool) {
 		for _, opt := range node.Options {
 			opt.StrValue = strings.ToLower(opt.StrValue)
 		}
+	case *Join:
+		node.ExplicitParens = false
+	case *ColumnDef:
+		node.Tp.CleanElemIsBinaryLit()
 	}
 	return in, false
 }
@@ -103,29 +173,49 @@ type NodeRestoreTestCase struct {
 	expectSQL string
 }
 
-func RunNodeRestoreTest(c *C, nodeTestCases []NodeRestoreTestCase, template string, extractNodeFunc func(node Node) Node) {
-	RunNodeRestoreTestWithFlags(c, nodeTestCases, template, extractNodeFunc, DefaultRestoreFlags)
+func runNodeRestoreTest(t *testing.T, nodeTestCases []NodeRestoreTestCase, template string, extractNodeFunc func(node Node) Node) {
+	runNodeRestoreTestWithFlags(t, nodeTestCases, template, extractNodeFunc, DefaultRestoreFlags)
 }
 
-func RunNodeRestoreTestWithFlags(c *C, nodeTestCases []NodeRestoreTestCase, template string, extractNodeFunc func(node Node) Node, flags RestoreFlags) {
-	parser := parser.New()
-	parser.EnableWindowFunc(true)
+func runNodeRestoreTestWithFlags(t *testing.T, nodeTestCases []NodeRestoreTestCase, template string, extractNodeFunc func(node Node) Node, flags RestoreFlags) {
+	p := parser.New()
+	p.EnableWindowFunc(true)
 	for _, testCase := range nodeTestCases {
 		sourceSQL := fmt.Sprintf(template, testCase.sourceSQL)
 		expectSQL := fmt.Sprintf(template, testCase.expectSQL)
-		stmt, err := parser.ParseOneStmt(sourceSQL, "", "")
-		comment := Commentf("source %#v", testCase)
-		c.Assert(err, IsNil, comment)
+		stmt, err := p.ParseOneStmt(sourceSQL, "", "")
+		comment := fmt.Sprintf("source %#v", testCase)
+		require.NoError(t, err, comment)
 		var sb strings.Builder
 		err = extractNodeFunc(stmt).Restore(NewRestoreCtx(flags, &sb))
-		c.Assert(err, IsNil, comment)
+		require.NoError(t, err, comment)
 		restoreSql := fmt.Sprintf(template, sb.String())
-		comment = Commentf("source %#v; restore %v", testCase, restoreSql)
-		c.Assert(restoreSql, Equals, expectSQL, comment)
-		stmt2, err := parser.ParseOneStmt(restoreSql, "", "")
-		c.Assert(err, IsNil, comment)
+		comment = fmt.Sprintf("source %#v; restore %v", testCase, restoreSql)
+		require.Equal(t, expectSQL, restoreSql, comment)
+		stmt2, err := p.ParseOneStmt(restoreSql, "", "")
+		require.NoError(t, err, comment)
 		CleanNodeText(stmt)
 		CleanNodeText(stmt2)
-		c.Assert(stmt2, DeepEquals, stmt, comment)
+		require.Equal(t, stmt, stmt2, comment)
+	}
+}
+
+// runNodeRestoreTestWithFlagsStmtChange likes runNodeRestoreTestWithFlags but not check if the ASTs are same.
+// Sometimes the AST are different and it's expected.
+func runNodeRestoreTestWithFlagsStmtChange(t *testing.T, nodeTestCases []NodeRestoreTestCase, template string, extractNodeFunc func(node Node) Node, flags RestoreFlags) {
+	p := parser.New()
+	p.EnableWindowFunc(true)
+	for _, testCase := range nodeTestCases {
+		sourceSQL := fmt.Sprintf(template, testCase.sourceSQL)
+		expectSQL := fmt.Sprintf(template, testCase.expectSQL)
+		stmt, err := p.ParseOneStmt(sourceSQL, "", "")
+		comment := fmt.Sprintf("source %#v", testCase)
+		require.NoError(t, err, comment)
+		var sb strings.Builder
+		err = extractNodeFunc(stmt).Restore(NewRestoreCtx(flags, &sb))
+		require.NoError(t, err, comment)
+		restoreSql := fmt.Sprintf(template, sb.String())
+		comment = fmt.Sprintf("source %#v; restore %v", testCase, restoreSql)
+		require.Equal(t, expectSQL, restoreSql, comment)
 	}
 }

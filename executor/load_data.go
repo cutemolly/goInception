@@ -56,7 +56,7 @@ func (e *LoadDataExec) Next(ctx context.Context, chk *chunk.Chunk) error {
 		return errors.New("Load Data: don't support load data without local field")
 	}
 	// TODO: support lines terminated is "".
-	if len(e.loadDataInfo.LinesInfo.Terminated) == 0 {
+	if len(derefString(e.loadDataInfo.LinesInfo.Terminated)) == 0 {
 		return errors.New("Load Data: don't support load data terminated is nil")
 	}
 
@@ -107,7 +107,7 @@ func (e *LoadDataInfo) SetMaxRowsInBatch(limit uint64) {
 // If the data doesn't have starting symbol, prevData is nil and curData is curData[len(curData)-startingLen+1:].
 // If curData size less than startingLen, curData is returned directly.
 func (e *LoadDataInfo) getValidData(prevData, curData []byte) ([]byte, []byte) {
-	startingLen := len(e.LinesInfo.Starting)
+	startingLen := len(derefString(e.LinesInfo.Starting))
 	if startingLen == 0 {
 		return prevData, curData
 	}
@@ -115,7 +115,7 @@ func (e *LoadDataInfo) getValidData(prevData, curData []byte) ([]byte, []byte) {
 	prevLen := len(prevData)
 	if prevLen > 0 {
 		// starting symbol in the prevData
-		idx := strings.Index(string(prevData), e.LinesInfo.Starting)
+		idx := strings.Index(string(prevData), derefString(e.LinesInfo.Starting))
 		if idx != -1 {
 			return prevData[idx:], curData
 		}
@@ -126,14 +126,14 @@ func (e *LoadDataInfo) getValidData(prevData, curData []byte) ([]byte, []byte) {
 			restStart = curData[:startingLen-1]
 		}
 		prevData = append(prevData, restStart...)
-		idx = strings.Index(string(prevData), e.LinesInfo.Starting)
+		idx = strings.Index(string(prevData), derefString(e.LinesInfo.Starting))
 		if idx != -1 {
 			return prevData[idx:prevLen], curData
 		}
 	}
 
 	// starting symbol in the curData
-	idx := strings.Index(string(curData), e.LinesInfo.Starting)
+	idx := strings.Index(string(curData), derefString(e.LinesInfo.Starting))
 	if idx != -1 {
 		return nil, curData[idx:]
 	}
@@ -148,21 +148,21 @@ func (e *LoadDataInfo) getValidData(prevData, curData []byte) ([]byte, []byte) {
 // getLine returns a line, curData, the next data start index and a bool value.
 // If it has starting symbol the bool is true, otherwise is false.
 func (e *LoadDataInfo) getLine(prevData, curData []byte) ([]byte, []byte, bool) {
-	startingLen := len(e.LinesInfo.Starting)
+	startingLen := len(derefString(e.LinesInfo.Starting))
 	prevData, curData = e.getValidData(prevData, curData)
 	if prevData == nil && len(curData) < startingLen {
 		return nil, curData, false
 	}
 
 	prevLen := len(prevData)
-	terminatedLen := len(e.LinesInfo.Terminated)
+	terminatedLen := len(derefString(e.LinesInfo.Terminated))
 	curStartIdx := 0
 	if prevLen < startingLen {
 		curStartIdx = startingLen - prevLen
 	}
 	endIdx := -1
 	if len(curData) >= curStartIdx {
-		endIdx = strings.Index(string(curData[curStartIdx:]), e.LinesInfo.Terminated)
+		endIdx = strings.Index(string(curData[curStartIdx:]), derefString(e.LinesInfo.Terminated))
 	}
 	if endIdx == -1 {
 		// no terminated symbol
@@ -172,7 +172,7 @@ func (e *LoadDataInfo) getLine(prevData, curData []byte) ([]byte, []byte, bool) 
 
 		// terminated symbol in the middle of prevData and curData
 		curData = append(prevData, curData...)
-		endIdx = strings.Index(string(curData[startingLen:]), e.LinesInfo.Terminated)
+		endIdx = strings.Index(string(curData[startingLen:]), derefString(e.LinesInfo.Terminated))
 		if endIdx != -1 {
 			nextDataIdx := startingLen + endIdx + terminatedLen
 			return curData[startingLen : startingLen+endIdx], curData[nextDataIdx:], true
@@ -189,7 +189,7 @@ func (e *LoadDataInfo) getLine(prevData, curData []byte) ([]byte, []byte, bool) 
 
 	// terminated symbol in the curData
 	prevData = append(prevData, curData[:nextDataIdx]...)
-	endIdx = strings.Index(string(prevData[startingLen:]), e.LinesInfo.Terminated)
+	endIdx = strings.Index(string(prevData[startingLen:]), derefString(e.LinesInfo.Terminated))
 	if endIdx >= prevLen {
 		return prevData[startingLen : startingLen+endIdx], curData[nextDataIdx:], true
 	}
@@ -232,7 +232,7 @@ func (e *LoadDataInfo) InsertData(prevData, curData []byte) ([]byte, bool, error
 			break
 		}
 		if line == nil && isEOF {
-			line = curData[len(e.LinesInfo.Starting):]
+			line = curData[len(derefString(e.LinesInfo.Starting)):]
 			curData = nil
 		}
 
@@ -303,17 +303,17 @@ type field struct {
 // getFieldsFromLine splits line according to fieldsInfo.
 func (e *LoadDataInfo) getFieldsFromLine(line []byte) ([]field, error) {
 	var sep []byte
-	if e.FieldsInfo.Enclosed != 0 {
-		if line[0] != e.FieldsInfo.Enclosed || line[len(line)-1] != e.FieldsInfo.Enclosed {
-			return nil, errors.Errorf("line %s should begin and end with %c", string(line), e.FieldsInfo.Enclosed)
+	if derefByte(e.FieldsInfo.Enclosed) != 0 {
+		if line[0] != derefByte(e.FieldsInfo.Enclosed) || line[len(line)-1] != derefByte(e.FieldsInfo.Enclosed) {
+			return nil, errors.Errorf("line %s should begin and end with %c", string(line), derefByte(e.FieldsInfo.Enclosed))
 		}
 		line = line[1 : len(line)-1]
-		sep = make([]byte, 0, len(e.FieldsInfo.Terminated)+2)
-		sep = append(sep, e.FieldsInfo.Enclosed)
-		sep = append(sep, e.FieldsInfo.Terminated...)
-		sep = append(sep, e.FieldsInfo.Enclosed)
+		sep = make([]byte, 0, len(derefString(e.FieldsInfo.Terminated))+2)
+		sep = append(sep, derefByte(e.FieldsInfo.Enclosed))
+		sep = append(sep, []byte(derefString(e.FieldsInfo.Terminated))...)
+		sep = append(sep, derefByte(e.FieldsInfo.Enclosed))
 	} else {
-		sep = []byte(e.FieldsInfo.Terminated)
+		sep = []byte(derefString(e.FieldsInfo.Terminated))
 	}
 	rawCols := bytes.Split(line, sep)
 	fields := make([]field, 0, len(rawCols))
@@ -376,3 +376,20 @@ func (k loadDataVarKeyType) String() string {
 
 // LoadDataVarKey is a variable key for load data.
 const LoadDataVarKey loadDataVarKeyType = 0
+
+// The upstream parser made the LOAD DATA clause options pointers so that "not
+// specified" is distinguishable from "empty". goInception reads them the old
+// way, where an unspecified option is the zero value, so normalize on read.
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func derefByte(s *string) byte {
+	if s == nil || len(*s) == 0 {
+		return 0
+	}
+	return (*s)[0]
+}

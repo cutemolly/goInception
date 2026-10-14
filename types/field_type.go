@@ -40,6 +40,10 @@ type FieldType struct {
 	Collate string
 	// Elems is the element list for enum and set type.
 	Elems []string
+	// ElemsIsBinaryLit indicates whether the corresponding element is a binary literal.
+	ElemsIsBinaryLit []bool
+	// Array indicates whether the type is an array type.
+	Array bool
 }
 
 // NewFieldType returns a FieldType,
@@ -327,18 +331,23 @@ func (ft *FieldType) Restore(ctx *format.RestoreCtx) error {
 }
 
 // RestoreAsCastType is used for write AST back to string.
-func (ft *FieldType) RestoreAsCastType(ctx *format.RestoreCtx) {
+func (ft *FieldType) RestoreAsCastType(ctx *format.RestoreCtx, explicitCharset bool) {
 	switch ft.Tp {
-	case mysql.TypeVarString:
+	case mysql.TypeVarString, mysql.TypeString:
+		skipWriteBinary := false
 		if ft.Charset == charset.CharsetBin && ft.Collate == charset.CollationBin {
 			ctx.WriteKeyWord("BINARY")
+			skipWriteBinary = true
 		} else {
 			ctx.WriteKeyWord("CHAR")
 		}
 		if ft.Flen != UnspecifiedLength {
 			ctx.WritePlainf("(%d)", ft.Flen)
 		}
-		if ft.Flag&mysql.BinaryFlag != 0 {
+		if !explicitCharset {
+			break
+		}
+		if !skipWriteBinary && ft.Flag&mysql.BinaryFlag != 0 {
 			ctx.WriteKeyWord(" BINARY")
 		}
 		if ft.Charset != charset.CharsetBin && ft.Charset != mysql.DefaultCharset {
@@ -372,6 +381,16 @@ func (ft *FieldType) RestoreAsCastType(ctx *format.RestoreCtx) {
 		}
 	case mysql.TypeJSON:
 		ctx.WriteKeyWord("JSON")
+	case mysql.TypeDouble:
+		ctx.WriteKeyWord("DOUBLE")
+	case mysql.TypeFloat:
+		ctx.WriteKeyWord("FLOAT")
+	case mysql.TypeYear:
+		ctx.WriteKeyWord("YEAR")
+	}
+	if ft.Array {
+		ctx.WritePlain(" ")
+		ctx.WriteKeyWord("ARRAY")
 	}
 }
 
@@ -383,12 +402,12 @@ func DefaultParamTypeForValue(value interface{}, tp *FieldType) {
 		tp.Flen = UnspecifiedLength
 		tp.Decimal = UnspecifiedLength
 	default:
-		DefaultTypeForValue(value, tp)
+		DefaultTypeForValue(value, tp, "", "")
 	}
 }
 
 // DefaultTypeForValue returns the default FieldType for the value.
-func DefaultTypeForValue(value interface{}, tp *FieldType) {
+func DefaultTypeForValue(value interface{}, tp *FieldType, char string, collate string) {
 	switch x := value.(type) {
 	case nil:
 		tp.Tp = mysql.TypeNull
@@ -422,8 +441,13 @@ func DefaultTypeForValue(value interface{}, tp *FieldType) {
 		// TODO: tp.Flen should be len(x) * 3 (max bytes length of CharsetUTF8)
 		tp.Flen = len(x)
 		tp.Decimal = UnspecifiedLength
-		tp.Charset = mysql.DefaultCharset
-		tp.Collate = mysql.DefaultCollationName
+		if len(char) > 0 {
+			tp.Charset = char
+			tp.Collate = collate
+		} else {
+			tp.Charset = mysql.DefaultCharset
+			tp.Collate = mysql.DefaultCollationName
+		}
 	case float64:
 		tp.Tp = mysql.TypeDouble
 		s := strconv.FormatFloat(x, 'f', -1, 64)
@@ -1473,10 +1497,10 @@ func SetBinChsClnFlag(ft *FieldType) {
 }
 
 // FormatAsCastType is used for write AST back to string.
-func (ft *FieldType) FormatAsCastType(w io.Writer) {
+func (ft *FieldType) FormatAsCastType(w io.Writer, explicitCharset bool) {
 	var sb strings.Builder
 	restoreCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
-	ft.RestoreAsCastType(restoreCtx)
+	ft.RestoreAsCastType(restoreCtx, explicitCharset)
 	fmt.Fprint(w, sb.String())
 }
 

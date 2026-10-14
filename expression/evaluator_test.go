@@ -120,7 +120,7 @@ func (s *testEvaluatorSuite) datumsToConstants(datums []types.Datum) []Expressio
 func (s *testEvaluatorSuite) primitiveValsToConstants(args []interface{}) []Expression {
 	cons := s.datumsToConstants(types.MakeDatums(args...))
 	for i, arg := range args {
-		types.DefaultTypeForValue(arg, cons[i].GetType())
+		types.DefaultTypeForValue(arg, cons[i].GetType(), "", "")
 	}
 	return cons
 }

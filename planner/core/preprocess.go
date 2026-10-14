@@ -25,6 +25,7 @@ import (
 	"github.com/hanchuanchuan/goInception/parser"
 	"github.com/hanchuanchuan/goInception/sessionctx"
 	"github.com/hanchuanchuan/goInception/types"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/util/charset"
 	"github.com/pingcap/errors"
 )
@@ -75,7 +76,7 @@ func (p *preprocessor) Enter(in ast.Node) (out ast.Node, skipChildren bool) {
 		p.checkDropDatabaseGrammar(node)
 	case *ast.ShowStmt:
 		p.resolveShowStmt(node)
-	case *ast.UnionSelectList:
+	case *ast.SetOprSelectList:
 		p.checkUnionSelectList(node)
 	case *ast.DeleteTableList:
 		return in, true
@@ -95,7 +96,7 @@ func (p *preprocessor) Leave(in ast.Node) (out ast.Node, ok bool) {
 		p.checkContainDotColumn(x)
 	case *ast.DropTableStmt, *ast.AlterTableStmt, *ast.RenameTableStmt:
 		p.inCreateOrDropTable = false
-	case *ast.ParamMarkerExpr:
+	case *driver.ParamMarkerExpr:
 		if !p.inPrepare {
 			p.err = parser.ErrSyntax.GenWithStack("syntax error, unexpected '?'")
 			return
@@ -105,8 +106,8 @@ func (p *preprocessor) Leave(in ast.Node) (out ast.Node, ok bool) {
 			break
 		}
 		valid := false
-		for i, length := 0, len(ast.ExplainFormats); i < length; i++ {
-			if strings.ToLower(x.Format) == ast.ExplainFormats[i] {
+		for i, length := 0, len(ExplainFormats); i < length; i++ {
+			if strings.ToLower(x.Format) == ExplainFormats[i] {
 				valid = true
 				break
 			}
@@ -125,6 +126,14 @@ func (p *preprocessor) Leave(in ast.Node) (out ast.Node, ok bool) {
 	return in, p.err == nil
 }
 
+// isNullLiteral reports whether the expression is a NULL literal. The upstream
+// parser no longer exposes GetDatum on ExprNode, so the node has to be asserted
+// to the driver type first.
+func isNullLiteral(expr ast.ExprNode) bool {
+	v, ok := expr.(*driver.ValueExpr)
+	return ok && v.GetDatum().IsNull()
+}
+
 func checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
 	var hasAutoIncrement bool
 
@@ -134,13 +143,13 @@ func checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, error) {
 			return hasAutoIncrement, nil
 		}
 		for _, op := range colDef.Options[num+1:] {
-			if op.Tp == ast.ColumnOptionDefaultValue && !op.Expr.GetDatum().IsNull() {
+			if op.Tp == ast.ColumnOptionDefaultValue && !isNullLiteral(op.Expr) {
 				return hasAutoIncrement, errors.Errorf("Invalid default value for '%s'", colDef.Name.Name.O)
 			}
 		}
 	}
 	if colDef.Options[num].Tp == ast.ColumnOptionDefaultValue && len(colDef.Options) != num+1 {
-		if colDef.Options[num].Expr.GetDatum().IsNull() {
+		if isNullLiteral(colDef.Options[num].Expr) {
 			return hasAutoIncrement, nil
 		}
 		for _, op := range colDef.Options[num+1:] {
@@ -226,16 +235,31 @@ func (p *preprocessor) checkAutoIncrement(stmt *ast.CreateTableStmt) {
 // checkUnionSelectList checks union's selectList.
 // refer: https://dev.mysql.com/doc/refman/5.7/en/union.html
 // "To apply ORDER BY or LIMIT to an individual SELECT, place the clause inside the parentheses that enclose the SELECT."
-func (p *preprocessor) checkUnionSelectList(stmt *ast.UnionSelectList) {
+func (p *preprocessor) checkUnionSelectList(stmt *ast.SetOprSelectList) {
+	// The upstream parser types the operands as []ast.Node, because an operand
+	// may itself be a parenthesised set operation.
 	for _, sel := range stmt.Selects[:len(stmt.Selects)-1] {
-		if sel.IsInBraces {
+		var (
+			inBraces bool
+			limit    *ast.Limit
+			orderBy  *ast.OrderByClause
+		)
+		switch x := sel.(type) {
+		case *ast.SelectStmt:
+			inBraces, limit, orderBy = x.IsInBraces, x.Limit, x.OrderBy
+		case *ast.SetOprStmt:
+			inBraces, limit, orderBy = x.IsInBraces, x.Limit, x.OrderBy
+		default:
 			continue
 		}
-		if sel.Limit != nil {
+		if inBraces {
+			continue
+		}
+		if limit != nil {
 			p.err = ErrWrongUsage.GenWithStackByArgs("UNION", "LIMIT")
 			return
 		}
-		if sel.OrderBy != nil {
+		if orderBy != nil {
 			p.err = ErrWrongUsage.GenWithStackByArgs("UNION", "ORDER BY")
 			return
 		}
@@ -243,14 +267,14 @@ func (p *preprocessor) checkUnionSelectList(stmt *ast.UnionSelectList) {
 }
 
 func (p *preprocessor) checkCreateDatabaseGrammar(stmt *ast.CreateDatabaseStmt) {
-	if isIncorrectName(stmt.Name) {
-		p.err = ddl.ErrWrongDBName.GenWithStackByArgs(stmt.Name)
+	if isIncorrectName(stmt.Name.O) {
+		p.err = ddl.ErrWrongDBName.GenWithStackByArgs(stmt.Name.O)
 	}
 }
 
 func (p *preprocessor) checkDropDatabaseGrammar(stmt *ast.DropDatabaseStmt) {
-	if isIncorrectName(stmt.Name) {
-		p.err = ddl.ErrWrongDBName.GenWithStackByArgs(stmt.Name)
+	if isIncorrectName(stmt.Name.O) {
+		p.err = ddl.ErrWrongDBName.GenWithStackByArgs(stmt.Name.O)
 	}
 }
 
@@ -354,21 +378,25 @@ func (p *preprocessor) checkCreateIndexGrammar(stmt *ast.CreateIndexStmt) {
 		p.err = ddl.ErrWrongTableName.GenWithStackByArgs(tName)
 		return
 	}
-	p.err = checkIndexInfo(stmt.IndexName, stmt.IndexColNames)
+	p.err = checkIndexInfo(stmt.IndexName, stmt.IndexPartSpecifications)
 }
 
 func (p *preprocessor) checkRenameTableGrammar(stmt *ast.RenameTableStmt) {
-	oldTable := stmt.OldTable.Name.String()
-	newTable := stmt.NewTable.Name.String()
+	// The upstream parser stores the rename pairs in TableToTables instead of
+	// a single OldTable/NewTable pair.
+	for _, table2Table := range stmt.TableToTables {
+		oldTable := table2Table.OldTable.Name.String()
+		newTable := table2Table.NewTable.Name.String()
 
-	if isIncorrectName(oldTable) {
-		p.err = ddl.ErrWrongTableName.GenWithStackByArgs(oldTable)
-		return
-	}
+		if isIncorrectName(oldTable) {
+			p.err = ddl.ErrWrongTableName.GenWithStackByArgs(oldTable)
+			return
+		}
 
-	if isIncorrectName(newTable) {
-		p.err = ddl.ErrWrongTableName.GenWithStackByArgs(newTable)
-		return
+		if isIncorrectName(newTable) {
+			p.err = ddl.ErrWrongTableName.GenWithStackByArgs(newTable)
+			return
+		}
 	}
 }
 
@@ -411,7 +439,7 @@ func (p *preprocessor) checkAlterTableGrammar(stmt *ast.AlterTableStmt) {
 }
 
 // checkDuplicateColumnName checks if index exists duplicated columns.
-func checkDuplicateColumnName(indexColNames []*ast.IndexColName) error {
+func checkDuplicateColumnName(indexColNames []*ast.IndexPartSpecification) error {
 	colNames := make(map[string]struct{}, len(indexColNames))
 	for _, indexColName := range indexColNames {
 		name := indexColName.Column.Name
@@ -424,7 +452,7 @@ func checkDuplicateColumnName(indexColNames []*ast.IndexColName) error {
 }
 
 // checkIndexInfo checks index name and index column names.
-func checkIndexInfo(indexName string, indexColNames []*ast.IndexColName) error {
+func checkIndexInfo(indexName string, indexColNames []*ast.IndexPartSpecification) error {
 	if strings.EqualFold(indexName, mysql.PrimaryKeyName) {
 		return ddl.ErrWrongNameForIndex.GenWithStackByArgs(indexName)
 	}

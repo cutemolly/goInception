@@ -231,6 +231,14 @@ func (e *Error) GenWithStackByArgs(args ...interface{}) error {
 	return errors.AddStack(&err)
 }
 
+// FastGenByArgs generates a new *Error with the same class and code, and new arguments.
+// This will not call runtime.Caller to get file and line.
+func (e *Error) FastGenByArgs(args ...interface{}) error {
+	err := *e
+	err.args = args
+	return &err
+}
+
 // FastGen generates a new *Error with the same class and code, and a new formatted message.
 // This will not call runtime.Caller to get file and line.
 func (e *Error) FastGen(format string, args ...interface{}) error {

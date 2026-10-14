@@ -5,6 +5,7 @@
 package session
 
 import (
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"bytes"
 	"fmt"
 	"strings"
@@ -45,14 +46,16 @@ func (s *session) maskingCommand(ctx context.Context, stmtNode ast.StmtNode,
 	switch node := stmtNode.(type) {
 	case *ast.UseStmt:
 		s.dbName = node.DBName
-	case *ast.UnionStmt, *ast.SelectStmt:
+	case *ast.SetOprStmt, *ast.SelectStmt:
 		p := masking{
 			session:       s,
 			maskingFields: make([]MaskingFieldInfo, 0),
 			buf:           new(bytes.Buffer),
 		}
 
-		_, _ = p.checkSelectItem(node, 0)
+		if resultSet, ok := node.(ast.ResultSetNode); ok {
+			_, _ = p.checkSelectItem(resultSet, 0)
+		}
 		fields := p.maskingFields
 		tree, err := json.Marshal(fields)
 		// tree1, _ := json.MarshalIndent(fields, "    ", "")
@@ -81,9 +84,9 @@ func (s *masking) checkSelectItem(node ast.ResultSetNode, level int) (
 	}
 
 	switch x := node.(type) {
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		for _, sel := range x.SelectList.Selects {
-			tmpTables, tmpFields := s.checkSubSelectItem(sel, level)
+			tmpTables, tmpFields := s.checkSubSelectItem(sel.(*ast.SelectStmt), level)
 			if tmpTables != nil {
 				tables = append(tables, tmpTables...)
 			}
@@ -121,7 +124,7 @@ func (s *masking) checkSelectItem(node ast.ResultSetNode, level int) (
 		case *ast.SelectStmt:
 			return s.checkSubSelectItem(tblSource, level+1)
 
-		case *ast.UnionStmt:
+		case *ast.SetOprStmt:
 			return s.checkSelectItem(tblSource, level+1)
 
 		default:
@@ -407,9 +410,9 @@ func (s *masking) checkItem(expr ast.ExprNode, tables []*TableInfo) (fields []Ma
 				fields = append(fields, *f)
 			}
 		}
-		if e.Refer != nil {
-			fields = append(fields, s.checkItem(e.Refer.Expr, tables)...)
-		}
+		// e.Refer used to expose the resolved expression, but the upstream
+		// parser dropped ResultField.Expr and no goInception code populated it,
+		// so there is nothing left to recurse into here.
 
 	case *ast.BinaryOperationExpr:
 		fields = append(fields, s.checkItem(e.L, tables)...)
@@ -436,7 +439,7 @@ func (s *masking) checkItem(expr ast.ExprNode, tables []*TableInfo) (fields []Ma
 		if e.Sel != nil {
 			fields = append(fields, s.checkItem(e.Sel, tables)...)
 		}
-	case *ast.PatternLikeExpr:
+	case *ast.PatternLikeOrIlikeExpr:
 		return s.checkItem(e.Expr, tables)
 	case *ast.PatternRegexpExpr:
 		return s.checkItem(e.Expr, tables)
@@ -450,7 +453,9 @@ func (s *masking) checkItem(expr ast.ExprNode, tables []*TableInfo) (fields []Ma
 		fields = append(fields, s.checkItem(e.R, tables)...)
 
 	case *ast.ExistsSubqueryExpr:
-		_, fields = s.checkSelectItem(e.Sel, 1)
+		if subquery, ok := e.Sel.(ast.ResultSetNode); ok {
+			_, fields = s.checkSelectItem(subquery, 1)
+		}
 		return fields
 
 	case *ast.IsNullExpr:
@@ -491,7 +496,7 @@ func (s *masking) checkItem(expr ast.ExprNode, tables []*TableInfo) (fields []Ma
 	case *ast.VariableExpr:
 		return s.checkItem(e.Value, tables)
 
-	case *ast.ValueExpr, *ast.ParamMarkerExpr, *ast.PositionExpr:
+	case *driver.ValueExpr, *driver.ParamMarkerExpr, *ast.PositionExpr:
 		// pass
 
 	default:
@@ -512,12 +517,12 @@ func (s *masking) getExprAliasName(field *ast.SelectField) string {
 		return e.Name.Name.String()
 	case *ast.BinaryOperationExpr, *ast.UnaryOperationExpr, *ast.FuncCallExpr,
 		*ast.FuncCastExpr,
-		*ast.AggregateFuncExpr, *ast.PatternInExpr, *ast.PatternLikeExpr,
+		*ast.AggregateFuncExpr, *ast.PatternInExpr, *ast.PatternLikeOrIlikeExpr,
 		*ast.PatternRegexpExpr, *ast.SubqueryExpr, *ast.CompareSubqueryExpr,
 		*ast.ExistsSubqueryExpr, *ast.IsNullExpr, *ast.IsTruthExpr,
 		*ast.BetweenExpr, *ast.CaseExpr, *ast.ParenthesesExpr,
 		*ast.RowExpr, *ast.ValuesExpr, *ast.VariableExpr,
-		*ast.ValueExpr, *ast.ParamMarkerExpr, *ast.PositionExpr:
+		*driver.ValueExpr, *driver.ParamMarkerExpr, *ast.PositionExpr:
 
 		return field.Text()
 

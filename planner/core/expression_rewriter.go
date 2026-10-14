@@ -27,6 +27,7 @@ import (
 	"github.com/hanchuanchuan/goInception/sessionctx"
 	"github.com/hanchuanchuan/goInception/sessionctx/variable"
 	"github.com/hanchuanchuan/goInception/types"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/util/chunk"
 	"github.com/pingcap/errors"
 )
@@ -36,7 +37,7 @@ var EvalSubquery func(p PhysicalPlan, is infoschema.InfoSchema, ctx sessionctx.C
 
 // evalAstExpr evaluates ast expression directly.
 func evalAstExpr(ctx sessionctx.Context, expr ast.ExprNode) (types.Datum, error) {
-	if val, ok := expr.(*ast.ValueExpr); ok {
+	if val, ok := expr.(*driver.ValueExpr); ok {
 		return val.Datum, nil
 	}
 	b := &PlanBuilder{
@@ -753,10 +754,10 @@ func (er *expressionRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok
 	switch v := inNode.(type) {
 	case *ast.AggregateFuncExpr, *ast.ColumnNameExpr, *ast.ParenthesesExpr, *ast.WhenClause,
 		*ast.SubqueryExpr, *ast.ExistsSubqueryExpr, *ast.CompareSubqueryExpr, *ast.ValuesExpr:
-	case *ast.ValueExpr:
+	case *driver.ValueExpr:
 		value := &expression.Constant{Value: v.Datum, RetType: &v.Type}
 		er.ctxStack = append(er.ctxStack, value)
-	case *ast.ParamMarkerExpr:
+	case *driver.ParamMarkerExpr:
 		tp := types.NewFieldType(mysql.TypeUnspecified)
 		types.DefaultParamTypeForValue(v.GetValue(), tp)
 		value := &expression.Constant{Value: v.Datum, RetType: tp}
@@ -785,7 +786,7 @@ func (er *expressionRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok
 			return retNode, false
 		}
 		er.ctxStack[len(er.ctxStack)-1] = expression.BuildCastFunction(er.ctx, arg, v.Tp)
-	case *ast.PatternLikeExpr:
+	case *ast.PatternLikeOrIlikeExpr:
 		er.likeToScalarFunc(v)
 	case *ast.PatternRegexpExpr:
 		er.regexpToScalarFunc(v)
@@ -801,6 +802,24 @@ func (er *expressionRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok
 		er.isNullToExpression(v)
 	case *ast.IsTruthExpr:
 		er.isTrueToScalarFunc(v)
+	// The upstream parser wraps the trim direction, the time unit and the
+	// GET_FORMAT selector in their own nodes; transcode them back to the
+	// generic values the builtins expect.
+	case *ast.TrimDirectionExpr:
+		er.ctxStack = append(er.ctxStack, &expression.Constant{
+			Value:   types.NewIntDatum(int64(v.Direction)),
+			RetType: types.NewFieldType(mysql.TypeTiny),
+		})
+	case *ast.TimeUnitExpr:
+		er.ctxStack = append(er.ctxStack, &expression.Constant{
+			Value:   types.NewStringDatum(v.Unit.String()),
+			RetType: types.NewFieldType(mysql.TypeVarchar),
+		})
+	case *ast.GetFormatSelectorExpr:
+		er.ctxStack = append(er.ctxStack, &expression.Constant{
+			Value:   types.NewStringDatum(v.Selector.String()),
+			RetType: types.NewFieldType(mysql.TypeVarchar),
+		})
 	default:
 		er.err = errors.Errorf("UnknownType: %T", v)
 		return retNode, false
@@ -820,7 +839,7 @@ func datumToConstant(d types.Datum, tp byte) *expression.Constant {
 	return &expression.Constant{Value: d, RetType: types.NewFieldType(tp)}
 }
 
-func (er *expressionRewriter) getParamExpression(v *ast.ParamMarkerExpr) expression.Expression {
+func (er *expressionRewriter) getParamExpression(v *driver.ParamMarkerExpr) expression.Expression {
 	f, err := expression.NewFunction(er.ctx,
 		ast.GetParam,
 		&v.Type,
@@ -893,7 +912,7 @@ func (er *expressionRewriter) unaryOpToExpression(v *ast.UnaryOperationExpr) {
 		op = ast.UnaryMinus
 	case opcode.BitNeg:
 		op = ast.BitNeg
-	case opcode.Not:
+	case opcode.Not, opcode.Not2:
 		op = ast.UnaryNot
 	default:
 		er.err = errors.Errorf("Unknown Unary Op %T", v.Op)
@@ -970,7 +989,7 @@ func (er *expressionRewriter) positionToScalarFunc(v *ast.PositionExpr) {
 
 func (er *expressionRewriter) isTrueToScalarFunc(v *ast.IsTruthExpr) {
 	stkLen := len(er.ctxStack)
-	op := ast.IsTruth
+	op := ast.IsTruthWithoutNull
 	if v.True == 0 {
 		op = ast.IsFalsity
 	}
@@ -1095,14 +1114,14 @@ func (er *expressionRewriter) caseToExpression(v *ast.CaseExpr) {
 	er.ctxStack = append(er.ctxStack, function)
 }
 
-func (er *expressionRewriter) likeToScalarFunc(v *ast.PatternLikeExpr) {
+func (er *expressionRewriter) likeToScalarFunc(v *ast.PatternLikeOrIlikeExpr) {
 	l := len(er.ctxStack)
 	er.err = expression.CheckArgsNotMultiColumnRow(er.ctxStack[l-2:]...)
 	if er.err != nil {
 		return
 	}
 	escapeTp := &types.FieldType{}
-	types.DefaultTypeForValue(int(v.Escape), escapeTp)
+	types.DefaultTypeForValue(int(v.Escape), escapeTp, "", "")
 	function := er.notToExpression(v.Not, ast.Like, &v.Type,
 		er.ctxStack[l-2], er.ctxStack[l-1], &expression.Constant{Value: types.NewIntDatum(int64(v.Escape)), RetType: escapeTp})
 	er.ctxStack = er.ctxStack[:l-2]

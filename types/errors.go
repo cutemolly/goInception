@@ -56,6 +56,8 @@ var (
 	// ErrWarnDataOutOfRange is returned when the value in a numeric column that is outside the permissible range of the column data type.
 	// See https://dev.mysql.com/doc/refman/5.5/en/out-of-range-and-overflow.html for details
 	ErrWarnDataOutOfRange = terror.ClassTypes.New(codeDataOutOfRange, mysql.MySQLErrName[mysql.ErrWarnDataOutOfRange])
+	// ErrDataOutOfRange is returned when meet a value out of range.
+	ErrDataOutOfRange = terror.ClassTypes.NewStd(mysql.ErrDataOutOfRange)
 )
 
 const (

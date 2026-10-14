@@ -14,6 +14,7 @@
 package core
 
 import (
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/ast"
 	"github.com/hanchuanchuan/goInception/expression"
 )
@@ -52,13 +53,13 @@ func (checker *cacheableChecker) Enter(in ast.Node) (out ast.Node, skipChildren 
 		}
 	case *ast.Limit:
 		if node.Count != nil {
-			if _, isParamMarker := node.Count.(*ast.ParamMarkerExpr); isParamMarker {
+			if _, isParamMarker := node.Count.(*driver.ParamMarkerExpr); isParamMarker {
 				checker.cacheable = false
 				return in, true
 			}
 		}
 		if node.Offset != nil {
-			if _, isParamMarker := node.Offset.(*ast.ParamMarkerExpr); isParamMarker {
+			if _, isParamMarker := node.Offset.(*driver.ParamMarkerExpr); isParamMarker {
 				checker.cacheable = false
 				return in, true
 			}

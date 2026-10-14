@@ -115,8 +115,8 @@ func (e *DDLExec) executeRenameTable(s *ast.RenameTableStmt) error {
 		// Now we only allow one schema changing at the same time.
 		return errors.Errorf("can't run multi schema change")
 	}
-	oldIdent := ast.Ident{Schema: s.OldTable.Schema, Name: s.OldTable.Name}
-	newIdent := ast.Ident{Schema: s.NewTable.Schema, Name: s.NewTable.Name}
+	oldIdent := ast.Ident{Schema: s.TableToTables[0].OldTable.Schema, Name: s.TableToTables[0].OldTable.Name}
+	newIdent := ast.Ident{Schema: s.TableToTables[0].NewTable.Schema, Name: s.TableToTables[0].NewTable.Name}
 	err := domain.GetDomain(e.ctx).DDL().RenameTable(e.ctx, oldIdent, newIdent)
 	return errors.Trace(err)
 }
@@ -134,7 +134,7 @@ func (e *DDLExec) executeCreateDatabase(s *ast.CreateDatabaseStmt) error {
 			}
 		}
 	}
-	err := domain.GetDomain(e.ctx).DDL().CreateSchema(e.ctx, model.NewCIStr(s.Name), opt)
+	err := domain.GetDomain(e.ctx).DDL().CreateSchema(e.ctx, s.Name, opt)
 	if err != nil {
 		if infoschema.ErrDatabaseExists.Equal(err) && s.IfNotExists {
 			err = nil
@@ -150,12 +150,12 @@ func (e *DDLExec) executeCreateTable(s *ast.CreateTableStmt) error {
 
 func (e *DDLExec) executeCreateIndex(s *ast.CreateIndexStmt) error {
 	ident := ast.Ident{Schema: s.Table.Schema, Name: s.Table.Name}
-	err := domain.GetDomain(e.ctx).DDL().CreateIndex(e.ctx, ident, s.Unique, model.NewCIStr(s.IndexName), s.IndexColNames, s.IndexOption)
+	err := domain.GetDomain(e.ctx).DDL().CreateIndex(e.ctx, ident, s.KeyType == ast.IndexKeyTypeUnique, model.NewCIStr(s.IndexName), s.IndexPartSpecifications, s.IndexOption)
 	return errors.Trace(err)
 }
 
 func (e *DDLExec) executeDropDatabase(s *ast.DropDatabaseStmt) error {
-	dbName := model.NewCIStr(s.Name)
+	dbName := s.Name
 
 	// Protect important system table from been dropped by a mistake.
 	// I can hardly find a case that a user really need to do this.

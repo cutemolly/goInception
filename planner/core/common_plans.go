@@ -26,6 +26,7 @@ import (
 	"github.com/hanchuanchuan/goInception/mysql"
 	"github.com/hanchuanchuan/goInception/sessionctx"
 	"github.com/hanchuanchuan/goInception/table"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/util/auth"
 	"github.com/hanchuanchuan/goInception/util/chunk"
 	"github.com/hanchuanchuan/goInception/util/kvcache"
@@ -156,7 +157,7 @@ func (e *Execute) OptimizePreparedPlan(ctx sessionctx.Context, is infoschema.Inf
 		if err != nil {
 			return errors.Trace(err)
 		}
-		prepared.Params[i].SetDatum(val)
+		prepared.Params[i].(*driver.ParamMarkerExpr).SetDatum(val)
 		vars.PreparedParams = append(vars.PreparedParams, val)
 	}
 	if prepared.SchemaVersion != is.SchemaMetaVersion() {
@@ -416,10 +417,24 @@ type Explain struct {
 	ExecPlan       Plan
 }
 
+// Valid formats for the EXPLAIN statement.
+// The upstream parser ast no longer exports these, so they are kept local to
+// the planner, which is the only place that validates and renders them.
+const (
+	ExplainFormatROW = "row"
+	ExplainFormatDOT = "dot"
+)
+
+// ExplainFormats stores the valid formats for explain statement, used by validator.
+var ExplainFormats = []string{
+	ExplainFormatROW,
+	ExplainFormatDOT,
+}
+
 // prepareSchema prepares explain's result schema.
 func (e *Explain) prepareSchema() error {
 	switch strings.ToLower(e.Format) {
-	case ast.ExplainFormatROW:
+	case ExplainFormatROW:
 		retFields := []string{"id", "count", "task", "operator info"}
 		if e.Analyze {
 			retFields = append(retFields, "execution info")
@@ -429,7 +444,7 @@ func (e *Explain) prepareSchema() error {
 			schema.Append(buildColumn("", fieldName, mysql.TypeString, mysql.MaxBlobWidth))
 		}
 		e.SetSchema(schema)
-	case ast.ExplainFormatDOT:
+	case ExplainFormatDOT:
 		retFields := []string{"dot contents"}
 		schema := expression.NewSchema(make([]*expression.Column, 0, len(retFields))...)
 		for _, fieldName := range retFields {
@@ -445,10 +460,10 @@ func (e *Explain) prepareSchema() error {
 // RenderResult renders the explain result as specified format.
 func (e *Explain) RenderResult() error {
 	switch strings.ToLower(e.Format) {
-	case ast.ExplainFormatROW:
+	case ExplainFormatROW:
 		e.explainedPlans = map[int]bool{}
 		e.explainPlanInRowFormat(e.StmtPlan.(PhysicalPlan), "root", "", true)
-	case ast.ExplainFormatDOT:
+	case ExplainFormatDOT:
 		e.prepareDotInfo(e.StmtPlan.(PhysicalPlan))
 	default:
 		return errors.Errorf("explain format '%s' is not supported now", e.Format)

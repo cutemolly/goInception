@@ -54,7 +54,7 @@ func (c *conditionChecker) checkScalarFunction(scalar *expression.ScalarFunction
 				return scalar.FuncName.L != ast.NE || c.length == types.UnspecifiedLength
 			}
 		}
-	case ast.IsNull, ast.IsTruth, ast.IsFalsity:
+	case ast.IsNull, ast.IsTruthWithoutNull, ast.IsFalsity:
 		return c.checkColumn(scalar.GetArgs()[0])
 	case ast.UnaryNot:
 		// TODO: support "not like" convert to access conditions.

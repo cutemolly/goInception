@@ -78,10 +78,10 @@ func (s *session) splitCommand(ctx context.Context, stmtNode ast.StmtNode,
 		return nil, nil
 
 	case *ast.CreateDatabaseStmt:
-		s.addSplitNode(node.Name, "", false, node, sql)
+		s.addSplitNode(node.Name.O, "", false, node, sql)
 
 	case *ast.DropDatabaseStmt:
-		s.addSplitNode(node.Name, "", false, node, sql)
+		s.addSplitNode(node.Name.O, "", false, node, sql)
 
 	case *ast.CreateTableStmt:
 		s.addSplitNode(node.Table.Schema.O, node.Table.Name.O, false, node, sql)
@@ -95,7 +95,7 @@ func (s *session) splitCommand(ctx context.Context, stmtNode ast.StmtNode,
 			return nil, nil
 		}
 	case *ast.RenameTableStmt:
-		s.addSplitNode(node.OldTable.Schema.O, node.OldTable.Name.O, false, node, sql)
+		s.addSplitNode(node.TableToTables[0].OldTable.Schema.O, node.TableToTables[0].OldTable.Name.O, false, node, sql)
 
 	case *ast.TruncateTableStmt:
 		s.addSplitNode(node.Table.Schema.O, node.Table.Name.O, true, node, sql)
@@ -107,7 +107,7 @@ func (s *session) splitCommand(ctx context.Context, stmtNode ast.StmtNode,
 	case *ast.DropIndexStmt:
 		s.addSplitNode(node.Table.Schema.O, node.Table.Name.O, false, node, sql)
 
-	case *ast.UnionStmt, *ast.SelectStmt:
+	case *ast.SetOprStmt, *ast.SelectStmt:
 		return nil, nil
 
 	case *ast.CreateViewStmt:

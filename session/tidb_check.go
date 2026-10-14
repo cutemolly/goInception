@@ -143,14 +143,14 @@ func (s *session) checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, er
 			return hasAutoIncrement, nil
 		}
 		for _, op := range colDef.Options[num+1:] {
-			if op.Tp == ast.ColumnOptionDefaultValue && !op.Expr.GetDatum().IsNull() {
+			if op.Tp == ast.ColumnOptionDefaultValue && !exprDatum(op.Expr).IsNull() {
 				return hasAutoIncrement,
 					errors.Errorf(fmt.Sprintf(s.getErrorMessage(ER_INVALID_DEFAULT), colDef.Name.Name.O))
 			}
 		}
 	}
 	if colDef.Options[num].Tp == ast.ColumnOptionDefaultValue && len(colDef.Options) != num+1 {
-		if colDef.Options[num].Expr.GetDatum().IsNull() {
+		if exprDatum(colDef.Options[num].Expr).IsNull() {
 			return hasAutoIncrement, nil
 		}
 		for _, op := range colDef.Options[num+1:] {
@@ -164,7 +164,7 @@ func (s *session) checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, er
 	return hasAutoIncrement, nil
 }
 
-func (s *session) checkDuplicateColumnName(indexColNames []*ast.IndexColName) {
+func (s *session) checkDuplicateColumnName(indexColNames []*ast.IndexPartSpecification) {
 	colNames := make(map[string]struct{}, len(indexColNames))
 	for _, indexColName := range indexColNames {
 		name := indexColName.Column.Name
@@ -176,7 +176,7 @@ func (s *session) checkDuplicateColumnName(indexColNames []*ast.IndexColName) {
 }
 
 // checkIndexInfo checks index name and index column names.
-func (s *session) checkIndexInfo(tableName, indexName string, indexColNames []*ast.IndexColName) {
+func (s *session) checkIndexInfo(tableName, indexName string, indexColNames []*ast.IndexPartSpecification) {
 	// if strings.EqualFold(indexName, mysql.PrimaryKeyName) {
 	// 	s.AppendErrorNo(ER_WRONG_NAME_FOR_INDEX, indexName, tableName)
 	// }
@@ -210,7 +210,7 @@ func (s *session) isInvalidDefaultValue(colDef *ast.ColumnDef) bool {
 				return true
 			}
 			if !types.IsTypeTime(tp.Tp) ||
-				columnOpt.Expr.GetDatum().IsNull() || isDefaultValNowSymFunc(columnOpt.Expr) {
+				exprDatum(columnOpt.Expr).IsNull() || isDefaultValNowSymFunc(columnOpt.Expr) {
 				return false
 			}
 
@@ -627,7 +627,7 @@ func (s *session) checkPartitionNameUnique(defs []*ast.PartitionDefinition) {
 			}
 			for _, values := range clause.Values {
 				for _, v := range values {
-					// key := fmt.Sprintf("%v", v.GetValue())
+					// key := fmt.Sprintf("%v", exprValue(v))
 					var buf bytes.Buffer
 					v.Format(&buf)
 					key := buf.String()
@@ -673,7 +673,7 @@ func (s *session) checkPartitionNameExists(t *TableInfo, defs []*ast.PartitionDe
 			partValues := make([]string, 0)
 			for _, values := range clause.Values {
 				for _, v := range values {
-					key := fmt.Sprintf("%v", v.GetValue())
+					key := fmt.Sprintf("%v", exprValue(v))
 					partValues = append(partValues, key)
 				}
 			}
@@ -681,7 +681,7 @@ func (s *session) checkPartitionNameExists(t *TableInfo, defs []*ast.PartitionDe
 
 		case *ast.PartitionDefinitionClauseLessThan:
 			for _, v := range clause.Exprs {
-				partDescription = fmt.Sprintf("%v", v.GetValue())
+				partDescription = fmt.Sprintf("%v", exprValue(v))
 				break
 			}
 		}

@@ -13,12 +13,22 @@
 
 package ast
 
+import "math"
+
+// UnspecifiedSize is unspecified size.
+const (
+	UnspecifiedSize = math.MaxUint64
+)
+
 // IsReadOnly checks whether the input ast is readOnly.
 func IsReadOnly(node Node) bool {
 	switch st := node.(type) {
 	case *SelectStmt:
-		if st.LockTp == SelectLockForUpdate {
-			return false
+		if st.LockInfo != nil {
+			switch st.LockInfo.LockType {
+			case SelectLockForUpdate, SelectLockForUpdateNoWait, SelectLockForUpdateWaitN:
+				return false
+			}
 		}
 
 		checker := readOnlyChecker{
@@ -27,8 +37,33 @@ func IsReadOnly(node Node) bool {
 
 		node.Accept(&checker)
 		return checker.readOnly
-	case *ExplainStmt, *DoStmt:
+	case *ExplainStmt:
+		return !st.Analyze || IsReadOnly(st.Stmt)
+	case *DoStmt, *ShowStmt:
 		return true
+	case *SetOprStmt:
+		for _, sel := range node.(*SetOprStmt).SelectList.Selects {
+			if !IsReadOnly(sel) {
+				return false
+			}
+		}
+		return true
+	case *SetOprSelectList:
+		for _, sel := range node.(*SetOprSelectList).Selects {
+			if !IsReadOnly(sel) {
+				return false
+			}
+		}
+		return true
+	case *AdminStmt:
+		switch node.(*AdminStmt).Tp {
+		case AdminShowTelemetry, AdminShowDDL, AdminShowDDLJobs, AdminShowSlow,
+			AdminCaptureBindings, AdminShowNextRowID, AdminShowDDLJobQueries,
+			AdminShowDDLJobQueriesWithRange:
+			return true
+		default:
+			return false
+		}
 	default:
 		return false
 	}
@@ -44,8 +79,7 @@ type readOnlyChecker struct {
 
 // Enter implements Visitor interface.
 func (checker *readOnlyChecker) Enter(in Node) (out Node, skipChildren bool) {
-	switch node := in.(type) {
-	case *VariableExpr:
+	if node, ok := in.(*VariableExpr); ok {
 		// like func rewriteVariable(), this stands for SetVar.
 		if !node.IsSystem && node.Value != nil {
 			checker.readOnly = false

@@ -18,18 +18,17 @@ package ast
 import (
 	"io"
 
-	. "github.com/hanchuanchuan/goInception/format"
+	"github.com/hanchuanchuan/goInception/parser/charset"
+	"github.com/hanchuanchuan/goInception/format"
 	"github.com/hanchuanchuan/goInception/model"
 	"github.com/hanchuanchuan/goInception/types"
-	"github.com/hanchuanchuan/goInception/util/chunk"
-	"golang.org/x/net/context"
 )
 
 // Node is the basic element of the AST.
 // Interfaces embed Node should have 'Node' name suffix.
 type Node interface {
 	// Restore returns the sql text from ast tree
-	Restore(ctx *RestoreCtx) error
+	Restore(ctx *format.RestoreCtx) error
 	// Accept accepts Visitor to visit itself.
 	// The returned node should replace original node.
 	// ok returns false to stop visiting.
@@ -39,10 +38,16 @@ type Node interface {
 	// children should be skipped. Otherwise, call its children in particular order that
 	// later elements depends on former elements. Finally, return visitor.Leave.
 	Accept(v Visitor) (node Node, ok bool)
-	// Text returns the original text of the element.
+	// Text returns the utf8 encoding text of the element.
 	Text() string
+	// OriginalText returns the original text of the element.
+	OriginalText() string
 	// SetText sets original text to the Node.
-	SetText(text string)
+	SetText(enc charset.Encoding, text string)
+	// SetOriginTextPosition set the start offset of this node in the origin text.
+	SetOriginTextPosition(offset int)
+	// OriginTextPosition get the start offset of this node in the origin text.
+	OriginTextPosition() int
 }
 
 // Flags indicates whether an expression contains certain types of expression.
@@ -68,14 +73,6 @@ type ExprNode interface {
 	SetType(tp *types.FieldType)
 	// GetType gets the evaluation type of the expression.
 	GetType() *types.FieldType
-	// SetValue sets value to the expression.
-	SetValue(val interface{})
-	// GetValue gets value of the expression.
-	GetValue() interface{}
-	// SetDatum sets datum to the expression.
-	SetDatum(datum types.Datum)
-	// GetDatum gets datum of the expression.
-	GetDatum() *types.Datum
 	// SetFlag sets flag to the expression.
 	// Flag indicates whether the expression contains
 	// parameter marker, reference, aggregate function...
@@ -128,49 +125,22 @@ type DMLNode interface {
 type ResultField struct {
 	Column       *model.ColumnInfo
 	ColumnAsName model.CIStr
-	Table        *model.TableInfo
-	TableAsName  model.CIStr
-	DBName       model.CIStr
+	// EmptyOrgName indicates whether this field has an empty org_name. A field has an empty org name, if it's an
+	// expression. It's not sure whether it's safe to use empty string in `.Column.Name`, so a new field is added to
+	// indicate whether it's empty.
+	EmptyOrgName bool
 
-	// Expr represents the expression for the result field. If it is generated from a select field, it would
-	// be the expression of that select field, otherwise the type would be ValueExpr and value
-	// will be set for every retrieved row.
-	Expr      ExprNode
-	TableName *TableName
-	// Referenced indicates the result field has been referenced or not.
-	// If not, we don't need to get the values.
-	Referenced bool
-}
-
-// RecordSet is an abstract result set interface to help get data from Plan.
-type RecordSet interface {
-	// Fields gets result fields.
-	Fields() []*ResultField
-
-	// Next reads records into chunk.
-	Next(ctx context.Context, chk *chunk.Chunk) error
-
-	// NewChunk creates a new chunk with initial capacity.
-	NewChunk() *chunk.Chunk
-
-	// Close closes the underlying iterator, call Next after Close will
-	// restart the iteration.
-	Close() error
-}
-
-// RowToDatums converts row to datum slice.
-func RowToDatums(row chunk.Row, fields []*ResultField) []types.Datum {
-	datums := make([]types.Datum, len(fields))
-	for i, f := range fields {
-		datums[i] = row.GetDatum(i, &f.Column.FieldType)
-	}
-	return datums
+	Table       *model.TableInfo
+	TableAsName model.CIStr
+	DBName      model.CIStr
 }
 
 // ResultSetNode interface has a ResultFields property, represents a Node that returns result set.
-// Implementations include SelectStmt, SubqueryExpr, TableSource, TableName and Join.
+// Implementations include SelectStmt, SubqueryExpr, TableSource, TableName, Join and SetOprStmt.
 type ResultSetNode interface {
 	Node
+
+	resultSet()
 }
 
 // SensitiveStmtNode overloads StmtNode and provides a SecureText method.
@@ -178,28 +148,6 @@ type SensitiveStmtNode interface {
 	StmtNode
 	// SecureText is different from Text that it hide password information.
 	SecureText() string
-}
-
-// Statement is an interface for SQL execution.
-// NOTE: all Statement implementations must be safe for
-// concurrent using by multiple goroutines.
-// If the Exec method requires any Execution domain local data,
-// they must be held out of the implementing instance.
-type Statement interface {
-	// OriginText gets the origin SQL text.
-	OriginText() string
-
-	// Exec executes SQL and gets a Recordset.
-	Exec(ctx context.Context) (RecordSet, error)
-
-	// IsPrepared returns whether this statement is prepared statement.
-	IsPrepared() bool
-
-	// IsReadOnly returns if the statement is read only. For example: SelectStmt without lock.
-	IsReadOnly() bool
-
-	// RebuildPlan rebuilds the plan of the statement.
-	RebuildPlan() (schemaVersion int64, err error)
 }
 
 // Visitor visits a Node.
@@ -214,4 +162,97 @@ type Visitor interface {
 	// Non-expression node must be the same type as the input node n.
 	// ok returns false to stop visiting.
 	Leave(n Node) (node Node, ok bool)
+}
+
+// GetStmtLabel generates a label for a statement.
+func GetStmtLabel(stmtNode StmtNode) string {
+	switch x := stmtNode.(type) {
+	case *AlterTableStmt:
+		return "AlterTable"
+	case *AnalyzeTableStmt:
+		return "AnalyzeTable"
+	case *BeginStmt:
+		return "Begin"
+	case *ChangeStmt:
+		return "Change"
+	case *CommitStmt:
+		return "Commit"
+	case *CompactTableStmt:
+		return "CompactTable"
+	case *CreateDatabaseStmt:
+		return "CreateDatabase"
+	case *CreateIndexStmt:
+		return "CreateIndex"
+	case *CreateTableStmt:
+		return "CreateTable"
+	case *CreateViewStmt:
+		return "CreateView"
+	case *CreateUserStmt:
+		return "CreateUser"
+	case *DeleteStmt:
+		return "Delete"
+	case *DropDatabaseStmt:
+		return "DropDatabase"
+	case *DropIndexStmt:
+		return "DropIndex"
+	case *DropTableStmt:
+		if x.IsView {
+			return "DropView"
+		}
+		return "DropTable"
+	case *ExplainStmt:
+		if _, ok := x.Stmt.(*ShowStmt); ok {
+			return "DescTable"
+		}
+		if x.Analyze {
+			return "ExplainAnalyzeSQL"
+		}
+		return "ExplainSQL"
+	case *InsertStmt:
+		if x.IsReplace {
+			return "Replace"
+		}
+		return "Insert"
+	case *ImportIntoStmt:
+		return "ImportInto"
+	case *LoadDataStmt:
+		return "LoadData"
+	case *RollbackStmt:
+		return "Rollback"
+	case *SelectStmt:
+		return "Select"
+	case *SetStmt, *SetPwdStmt:
+		return "Set"
+	case *ShowStmt:
+		return "Show"
+	case *TruncateTableStmt:
+		return "TruncateTable"
+	case *UpdateStmt:
+		return "Update"
+	case *GrantStmt:
+		return "Grant"
+	case *RevokeStmt:
+		return "Revoke"
+	case *DeallocateStmt:
+		return "Deallocate"
+	case *ExecuteStmt:
+		return "Execute"
+	case *PrepareStmt:
+		return "Prepare"
+	case *UseStmt:
+		return "Use"
+	case *CreateBindingStmt:
+		return "CreateBinding"
+	case *IndexAdviseStmt:
+		return "IndexAdvise"
+	case *DropBindingStmt:
+		return "DropBinding"
+	case *TraceStmt:
+		return "Trace"
+	case *ShutdownStmt:
+		return "Shutdown"
+	case *SavepointStmt:
+		return "Savepoint"
+	}
+	return "other"
 }

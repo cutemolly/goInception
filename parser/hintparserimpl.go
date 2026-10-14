@@ -16,20 +16,23 @@ package parser
 import (
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/hanchuanchuan/goInception/ast"
 	"github.com/hanchuanchuan/goInception/mysql"
 	"github.com/hanchuanchuan/goInception/terror"
 )
 
+//revive:disable:exported
 var (
-	ErrWarnOptimizerHintUnsupportedHint = terror.ClassParser.New(mysql.ErrWarnOptimizerHintUnsupportedHint, mysql.MySQLErrName[mysql.ErrWarnOptimizerHintUnsupportedHint])
-	ErrWarnOptimizerHintInvalidToken    = terror.ClassParser.New(mysql.ErrWarnOptimizerHintInvalidToken, mysql.MySQLErrName[mysql.ErrWarnOptimizerHintInvalidToken])
-	ErrWarnMemoryQuotaOverflow          = terror.ClassParser.New(mysql.ErrWarnMemoryQuotaOverflow, mysql.MySQLErrName[mysql.ErrWarnMemoryQuotaOverflow])
-	ErrWarnOptimizerHintParseError      = terror.ClassParser.New(mysql.ErrWarnOptimizerHintParseError, mysql.MySQLErrName[mysql.ErrWarnOptimizerHintParseError])
-	ErrWarnOptimizerHintInvalidInteger  = terror.ClassParser.New(mysql.ErrWarnOptimizerHintInvalidInteger, mysql.MySQLErrName[mysql.ErrWarnOptimizerHintInvalidInteger])
+	ErrWarnOptimizerHintUnsupportedHint = terror.ClassParser.NewStd(mysql.ErrWarnOptimizerHintUnsupportedHint)
+	ErrWarnOptimizerHintInvalidToken    = terror.ClassParser.NewStd(mysql.ErrWarnOptimizerHintInvalidToken)
+	ErrWarnMemoryQuotaOverflow          = terror.ClassParser.NewStd(mysql.ErrWarnMemoryQuotaOverflow)
+	ErrWarnOptimizerHintParseError      = terror.ClassParser.NewStd(mysql.ErrWarnOptimizerHintParseError)
+	ErrWarnOptimizerHintInvalidInteger  = terror.ClassParser.NewStd(mysql.ErrWarnOptimizerHintInvalidInteger)
+	ErrWarnOptimizerHintWrongPos        = terror.ClassParser.NewStd(mysql.ErrWarnOptimizerHintWrongPos)
 )
+
+//revive:enable:exported
 
 // hintScanner implements the yyhintLexer interface
 type hintScanner struct {
@@ -38,7 +41,7 @@ type hintScanner struct {
 
 func (hs *hintScanner) Errorf(format string, args ...interface{}) error {
 	inner := hs.Scanner.Errorf(format, args...)
-	return ErrWarnOptimizerHintParseError.GenWithStackByArgs(inner)
+	return ErrParse.GenWithStackByArgs("Optimizer hint syntax error at", inner)
 }
 
 func (hs *hintScanner) Lex(lval *yyhintSymType) int {
@@ -51,7 +54,7 @@ func (hs *hintScanner) Lex(lval *yyhintSymType) int {
 		n, e := strconv.ParseUint(lit, 10, 64)
 		if e != nil {
 			hs.AppendError(ErrWarnOptimizerHintInvalidInteger.GenWithStackByArgs(lit))
-			return int(unicode.ReplacementChar)
+			return hintInvalid
 		}
 		lval.number = n
 		return hintIntLit
@@ -108,7 +111,7 @@ func (hs *hintScanner) Lex(lval *yyhintSymType) int {
 	}
 
 	hs.AppendError(ErrWarnOptimizerHintInvalidToken.GenWithStackByArgs(errorTokenType, lit, tok))
-	return int(unicode.ReplacementChar)
+	return hintInvalid
 }
 
 type hintParser struct {
@@ -129,11 +132,11 @@ func (hp *hintParser) parse(input string, sqlMode mysql.SQLMode, initPos Pos) ([
 	hp.result = nil
 	hp.lexer.reset(input[3:])
 	hp.lexer.SetSQLMode(sqlMode)
-	hp.lexer.r.p = Pos{
+	hp.lexer.r.updatePos(Pos{
 		Line:   initPos.Line,
 		Col:    initPos.Col + 3, // skipped the initial '/*+'
 		Offset: 0,
-	}
+	})
 	hp.lexer.inBangComment = true // skip the final '*/' (we need the '*/' for reporting warnings)
 
 	yyhintParse(&hp.lexer, hp)

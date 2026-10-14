@@ -1422,8 +1422,10 @@ func (s *testSuite) TestQualifiedDelete(c *C) {
 	r := tk.MustQuery("select * from t1")
 	c.Assert(r.Rows(), HasLen, 0)
 
-	_, err := tk.Exec("delete from t1 as a where a.c1 = 1")
-	c.Assert(err, NotNil)
+	// MySQL 8.0 allows a table alias in a single-table DELETE, which the
+	// upgraded parser now accepts.
+	tk.MustExec("delete from t1 as a where a.c1 = 1")
+	tk.CheckExecResult(0, 0)
 
 	tk.MustExec("insert into t1 values (1, 1), (2, 2)")
 	tk.MustExec("insert into t2 values (2, 1), (3,1)")
@@ -1434,7 +1436,7 @@ func (s *testSuite) TestQualifiedDelete(c *C) {
 	tk.MustExec("delete a, b from t1 as a join t2 as b where a.c2 = b.c1")
 	tk.CheckExecResult(2, 0)
 
-	_, err = tk.Exec("delete t1, t2 from t1 as a join t2 as b where a.c2 = b.c1")
+	_, err := tk.Exec("delete t1, t2 from t1 as a join t2 as b where a.c2 = b.c1")
 	c.Assert(err, NotNil)
 }
 
@@ -1499,7 +1501,8 @@ func (s *testSuite) TestLoadData(c *C) {
 	c.Assert(sc.WarningCount(), Equals, uint16(1))
 
 	// lines starting symbol is "" and terminated symbol length is 2, InsertData returns data is nil
-	ld.LinesInfo.Terminated = "||"
+	terminated := "||"
+	ld.LinesInfo.Terminated = &terminated
 	tests = []testCase{
 		// data1 != nil, data2 != nil
 		{[]byte("0\t2\t3"), []byte("\t4\t5||"), []string{"12|2|3|4"}, nil},
@@ -1515,9 +1518,9 @@ func (s *testSuite) TestLoadData(c *C) {
 	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
 
 	// fields and lines aren't default, InsertData returns data is nil
-	ld.FieldsInfo.Terminated = "\\"
-	ld.LinesInfo.Starting = "xxx"
-	ld.LinesInfo.Terminated = "|!#^"
+	ld.FieldsInfo.Terminated = strPtr("\\")
+	ld.LinesInfo.Starting = strPtr("xxx")
+	ld.LinesInfo.Terminated = strPtr("|!#^")
 	tests = []testCase{
 		// data1 = nil, data2 != nil
 		{nil, []byte("xxx|!#^"), []string{"13|<nil>|<nil>|<nil>"}, nil},
@@ -1568,7 +1571,7 @@ func (s *testSuite) TestLoadData(c *C) {
 	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
 
 	// lines starting symbol is the same as terminated symbol, InsertData returns data is nil
-	ld.LinesInfo.Terminated = "xxx"
+	ld.LinesInfo.Terminated = strPtr("xxx")
 	tests = []testCase{
 		// data1 = nil, data2 != nil
 		{nil, []byte("xxxxxx"), []string{"29|<nil>|<nil>|<nil>"}, nil},
@@ -2105,4 +2108,10 @@ func (s *testSuite) TestDeferConstraintCheckForInsert(c *C) {
 	tk.MustExec(`update t set i = 2 where i = 1;`)
 	tk.MustExec(`commit;`)
 	tk.MustQuery(`select * from t;`).Check(testkit.Rows("2"))
+}
+
+// strPtr returns a pointer to s, for the LOAD DATA clause options that the
+// upstream parser turned into pointers.
+func strPtr(s string) *string {
+	return &s
 }

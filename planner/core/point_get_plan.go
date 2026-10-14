@@ -26,6 +26,7 @@ import (
 	"github.com/hanchuanchuan/goInception/privilege"
 	"github.com/hanchuanchuan/goInception/sessionctx"
 	"github.com/hanchuanchuan/goInception/types"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tipb/go-tipb"
 )
@@ -145,7 +146,7 @@ func TryFastPlan(ctx sessionctx.Context, node ast.Node) Plan {
 // 3. All the columns must be public and generated.
 // 4. The condition is an access path that the range is a unique key.
 func tryPointGetPlan(ctx sessionctx.Context, selStmt *ast.SelectStmt) *PointGetPlan {
-	if selStmt.Having != nil || selStmt.LockTp != ast.SelectLockNone {
+	if selStmt.Having != nil || selStmt.LockInfo != nil {
 		return nil
 	} else if selStmt.Limit != nil {
 		sc := ctx.GetSessionVars().StmtCtx
@@ -336,9 +337,9 @@ func getNameValuePairs(nvPairs []nameValuePair, expr ast.ExprNode) []nameValuePa
 		}
 		var d types.Datum
 		switch x := binOp.R.(type) {
-		case *ast.ValueExpr:
+		case *driver.ValueExpr:
 			d = x.Datum
-		case *ast.ParamMarkerExpr:
+		case *driver.ParamMarkerExpr:
 			d = x.Datum
 		}
 		if d.IsNull() {

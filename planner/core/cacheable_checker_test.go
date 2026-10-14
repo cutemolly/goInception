@@ -14,6 +14,7 @@
 package core
 
 import (
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/ast"
 	"github.com/hanchuanchuan/goInception/expression"
 	"github.com/hanchuanchuan/goInception/model"
@@ -33,7 +34,7 @@ func (s *testCacheableSuite) TestCacheable(c *C) {
 	stmt = &ast.InsertStmt{}
 	c.Assert(Cacheable(stmt), IsFalse)
 
-	stmt = &ast.UnionStmt{}
+	stmt = &ast.SetOprStmt{}
 	c.Assert(Cacheable(stmt), IsFalse)
 
 	stmt = &ast.UpdateStmt{}
@@ -66,7 +67,7 @@ func (s *testCacheableSuite) TestCacheable(c *C) {
 	c.Assert(Cacheable(stmt), IsFalse)
 
 	limitStmt := &ast.Limit{
-		Count: &ast.ParamMarkerExpr{},
+		Count: &driver.ParamMarkerExpr{},
 	}
 	stmt = &ast.SelectStmt{
 		Limit: limitStmt,
@@ -74,7 +75,7 @@ func (s *testCacheableSuite) TestCacheable(c *C) {
 	c.Assert(Cacheable(stmt), IsFalse)
 
 	limitStmt = &ast.Limit{
-		Offset: &ast.ParamMarkerExpr{},
+		Offset: &driver.ParamMarkerExpr{},
 	}
 	stmt = &ast.SelectStmt{
 		Limit: limitStmt,

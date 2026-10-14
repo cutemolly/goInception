@@ -69,11 +69,16 @@ const (
 	PartKeyFlag        uint = 1 << 14 /* Intern: Part of some keys */
 	NumFlag            uint = 1 << 15 /* Field is a num (for clients) */
 
-	GroupFlag       uint = 1 << 15 /* Internal: Group field */
-	UniqueFlag      uint = 1 << 16 /* Internal: Used by sql_yacc */
-	BinCmpFlag      uint = 1 << 17 /* Internal: Used by sql_yacc */
-	ParseToJSONFlag uint = 1 << 18 /* Internal: Used when we want to parse string to JSON in CAST */
-	IsBooleanFlag   uint = 1 << 19 /* Internal: Used for telling boolean literal from integer */
+	GroupFlag             uint = 1 << 15 /* Internal: Group field */
+	UniqueFlag            uint = 1 << 16 /* Internal: Used by sql_yacc */
+	BinCmpFlag            uint = 1 << 17 /* Internal: Used by sql_yacc */
+	ParseToJSONFlag       uint = 1 << 18 /* Internal: Used when we want to parse string to JSON in CAST */
+	IsBooleanFlag         uint = 1 << 19 /* Internal: Used for telling boolean literal from integer */
+	PreventNullInsertFlag uint = 1 << 20 /* Prevent this Field from inserting NULL values */
+	EnumSetAsIntFlag      uint = 1 << 21 /* Internal: Used for inferring enum eval type. */
+	DropColumnIndexFlag   uint = 1 << 22 /* Internal: Used for indicate the column is being dropped with index */
+	GeneratedColumnFlag   uint = 1 << 23 /* Internal: TiFlash will check this flag and add a placeholder for this column */
+	UnderScoreCharsetFlag uint = 1 << 24 /* Internal: Indicate whether charset is specified by underscore like _latin1'abc' */
 )
 
 // TypeInt24 bounds.

@@ -18,6 +18,10 @@ func HasAggFlag(expr ExprNode) bool {
 	return expr.GetFlag()&FlagHasAggregateFunc > 0
 }
 
+func HasWindowFlag(expr ExprNode) bool {
+	return expr.GetFlag()&FlagHasWindowFunc > 0
+}
+
 // SetFlag sets flag for expression.
 func SetFlag(n Node) {
 	var setter flagSetter
@@ -32,9 +36,14 @@ func (f *flagSetter) Enter(in Node) (Node, bool) {
 }
 
 func (f *flagSetter) Leave(in Node) (Node, bool) {
+	if x, ok := in.(ParamMarkerExpr); ok {
+		x.SetFlag(FlagHasParamMarker)
+	}
 	switch x := in.(type) {
 	case *AggregateFuncExpr:
 		f.aggregateFunc(x)
+	case *WindowFuncExpr:
+		f.windowFunc(x)
 	case *BetweenExpr:
 		x.SetFlag(x.Expr.GetFlag() | x.Left.GetFlag() | x.Right.GetFlag())
 	case *BinaryOperationExpr:
@@ -57,13 +66,11 @@ func (f *flagSetter) Leave(in Node) (Node, bool) {
 		x.SetFlag(x.Expr.GetFlag())
 	case *IsTruthExpr:
 		x.SetFlag(x.Expr.GetFlag())
-	case *ParamMarkerExpr:
-		x.SetFlag(FlagHasParamMarker)
 	case *ParenthesesExpr:
 		x.SetFlag(x.Expr.GetFlag())
 	case *PatternInExpr:
 		f.patternIn(x)
-	case *PatternLikeExpr:
+	case *PatternLikeOrIlikeExpr:
 		f.patternLike(x)
 	case *PatternRegexpExpr:
 		f.patternRegexp(x)
@@ -75,7 +82,6 @@ func (f *flagSetter) Leave(in Node) (Node, bool) {
 		x.SetFlag(FlagHasSubquery)
 	case *UnaryOperationExpr:
 		x.SetFlag(x.V.GetFlag())
-	case *ValueExpr:
 	case *ValuesExpr:
 		x.SetFlag(FlagHasReference)
 	case *VariableExpr:
@@ -115,7 +121,7 @@ func (f *flagSetter) patternIn(x *PatternInExpr) {
 	x.SetFlag(flag)
 }
 
-func (f *flagSetter) patternLike(x *PatternLikeExpr) {
+func (f *flagSetter) patternLike(x *PatternLikeOrIlikeExpr) {
 	flag := x.Pattern.GetFlag()
 	if x.Expr != nil {
 		flag |= x.Expr.GetFlag()
@@ -149,6 +155,14 @@ func (f *flagSetter) funcCall(x *FuncCallExpr) {
 
 func (f *flagSetter) aggregateFunc(x *AggregateFuncExpr) {
 	flag := FlagHasAggregateFunc
+	for _, val := range x.Args {
+		flag |= val.GetFlag()
+	}
+	x.SetFlag(flag)
+}
+
+func (f *flagSetter) windowFunc(x *WindowFuncExpr) {
+	flag := FlagHasWindowFunc
 	for _, val := range x.Args {
 		flag |= val.GetFlag()
 	}

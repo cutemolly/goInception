@@ -5,6 +5,7 @@
 package session
 
 import (
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"fmt"
 
 	"golang.org/x/net/context"
@@ -136,7 +137,7 @@ func printItem(expr ast.ExprNode) interface{} {
 	// 	}
 	// 	return field
 
-	case *ast.ValueExpr:
+	case *driver.ValueExpr:
 		v := e.GetDatum().GetValue()
 		value := make(map[string]string, 2)
 		value["type"] = fmt.Sprintf("%T", v)
@@ -205,19 +206,30 @@ func (s *session) printSelectItem(node ast.ResultSetNode) bool {
 	log.Debug("printSelectItem")
 
 	switch x := node.(type) {
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		stmt := x.SelectList
 		for _, sel := range stmt.Selects[:len(stmt.Selects)-1] {
-			if sel.Limit != nil {
+			// The upstream parser types the operands as ast.Node.
+			var limit *ast.Limit
+			var orderBy *ast.OrderByClause
+			switch v := sel.(type) {
+			case *ast.SelectStmt:
+				limit, orderBy = v.Limit, v.OrderBy
+			case *ast.SetOprStmt:
+				limit, orderBy = v.Limit, v.OrderBy
+			}
+			if limit != nil {
 				s.appendErrorNo(ErrWrongUsage, "UNION", "LIMIT")
 			}
-			if sel.OrderBy != nil {
+			if orderBy != nil {
 				s.appendErrorNo(ErrWrongUsage, "UNION", "ORDER BY")
 			}
 		}
 
 		for _, sel := range stmt.Selects {
-			s.printSubSelectItem(sel)
+			if selectStmt, ok := sel.(*ast.SelectStmt); ok {
+				s.printSubSelectItem(selectStmt)
+			}
 		}
 
 	case *ast.SelectStmt:

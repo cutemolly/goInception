@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/hanchuanchuan/goInception/ast"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/ddl"
 	"github.com/hanchuanchuan/goInception/model"
 	"github.com/hanchuanchuan/goInception/parser"
@@ -117,7 +118,9 @@ func (col *column) parseColumnOptions(ops []*ast.ColumnOption) {
 		case ast.ColumnOptionPrimaryKey, ast.ColumnOptionUniqKey, ast.ColumnOptionAutoIncrement:
 			col.table.uniqIndices[col.name] = col
 		case ast.ColumnOptionComment:
-			col.comment = op.Expr.GetDatum().GetString()
+			if v, ok := op.Expr.(*driver.ValueExpr); ok {
+				col.comment = v.GetDatum().GetString()
+			}
 		}
 	}
 }
@@ -250,9 +253,9 @@ func parseIndex(table *table, stmt *ast.CreateIndexStmt) error {
 		return errors.Errorf("mismatch table name for create index - %s : %s", table.name, stmt.Table.Name.L)
 	}
 
-	for _, indexCol := range stmt.IndexColNames {
+	for _, indexCol := range stmt.IndexPartSpecifications {
 		name := indexCol.Column.Name.L
-		if stmt.Unique {
+		if stmt.KeyType == ast.IndexKeyTypeUnique {
 			table.uniqIndices[name] = table.findCol(table.columns, name)
 		} else {
 			table.indices[name] = table.findCol(table.columns, name)

@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-	"reflect"
 	"strings"
 	"unicode"
 
@@ -35,6 +34,7 @@ import (
 	"github.com/hanchuanchuan/goInception/statistics"
 	"github.com/hanchuanchuan/goInception/table"
 	"github.com/hanchuanchuan/goInception/types"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/util/chunk"
 	"github.com/pingcap/errors"
 	"modernc.org/mathutil"
@@ -134,7 +134,7 @@ func (b *PlanBuilder) buildResultSetNode(node ast.ResultSetNode) (p LogicalPlan,
 		switch v := x.Source.(type) {
 		case *ast.SelectStmt:
 			p, err = b.buildSelect(v)
-		case *ast.UnionStmt:
+		case *ast.SetOprStmt:
 			p, err = b.buildUnion(v)
 		case *ast.TableName:
 			p, err = b.buildDataSource(v)
@@ -168,7 +168,7 @@ func (b *PlanBuilder) buildResultSetNode(node ast.ResultSetNode) (p LogicalPlan,
 		return p, nil
 	case *ast.SelectStmt:
 		return b.buildSelect(x)
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		return b.buildUnion(x)
 	default:
 		return nil, ErrUnsupportedType.GenWithStack("Unsupported ast.ResultSetNode(%T) for buildResultSetNode()", x)
@@ -362,10 +362,10 @@ func (b *PlanBuilder) buildJoin(joinNode *ast.Join) (LogicalPlan, error) {
 // on the "USING" clause.
 //
 // According to the standard SQL, columns are ordered in the following way:
-// 1. coalesced common columns of "leftPlan" and "rightPlan", in the order they
-//    appears in "leftPlan".
-// 2. the rest columns in "leftPlan", in the order they appears in "leftPlan".
-// 3. the rest columns in "rightPlan", in the order they appears in "rightPlan".
+//  1. coalesced common columns of "leftPlan" and "rightPlan", in the order they
+//     appears in "leftPlan".
+//  2. the rest columns in "leftPlan", in the order they appears in "leftPlan".
+//  3. the rest columns in "rightPlan", in the order they appears in "rightPlan".
 func (b *PlanBuilder) buildUsingClause(p *LogicalJoin, leftPlan, rightPlan LogicalPlan, join *ast.Join) error {
 	filter := make(map[string]bool, len(join.Using))
 	for _, col := range join.Using {
@@ -377,9 +377,10 @@ func (b *PlanBuilder) buildUsingClause(p *LogicalJoin, leftPlan, rightPlan Logic
 // buildNaturalJoin builds natural join output schema. It finds out all the common columns
 // then using the same mechanism as buildUsingClause to eliminate redundant columns and build join conditions.
 // According to standard SQL, producing this display order:
-// 	All the common columns
-// 	Every column in the first (left) table that is not a common column
-// 	Every column in the second (right) table that is not a common column
+//
+//	All the common columns
+//	Every column in the first (left) table that is not a common column
+//	Every column in the second (right) table that is not a common column
 func (b *PlanBuilder) buildNaturalJoin(p *LogicalJoin, leftPlan, rightPlan LogicalPlan, join *ast.Join) error {
 	return b.coalesceCommonColumns(p, leftPlan, rightPlan, join.Tp == ast.RightJoin, nil)
 }
@@ -518,7 +519,7 @@ func (b *PlanBuilder) buildProjectionFieldNameFromExpressions(field *ast.SelectF
 	}
 
 	innerExpr := getInnerFromParentheses(field.Expr)
-	valueExpr, isValueExpr := innerExpr.(*ast.ValueExpr)
+	valueExpr, isValueExpr := innerExpr.(*driver.ValueExpr)
 
 	// Non-literal: Output as inputed, except that comments need to be removed.
 	if !isValueExpr {
@@ -684,25 +685,13 @@ func (b *PlanBuilder) buildProjection4Union(u *LogicalUnionAll) {
 	}
 }
 
-func (b *PlanBuilder) buildUnion(union *ast.UnionStmt) (LogicalPlan, error) {
+func (b *PlanBuilder) buildUnion(union *ast.SetOprStmt) (LogicalPlan, error) {
 	distinctSelectPlans, allSelectPlans, err := b.divideUnionSelectPlans(union.SelectList.Selects)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
-	unionDistinctPlan := b.buildUnionAll(distinctSelectPlans)
-	if unionDistinctPlan != nil {
-		unionDistinctPlan = b.buildDistinct(unionDistinctPlan, unionDistinctPlan.Schema().Len())
-		if len(allSelectPlans) > 0 {
-			allSelectPlans = append(allSelectPlans, unionDistinctPlan)
-		}
-	}
-
-	unionAllPlan := b.buildUnionAll(allSelectPlans)
-	unionPlan := unionDistinctPlan
-	if unionAllPlan != nil {
-		unionPlan = unionAllPlan
-	}
+	unionPlan := b.buildSetOprPlan(distinctSelectPlans, allSelectPlans)
 
 	if union.OrderBy != nil {
 		unionPlan, err = b.buildSort(unionPlan, union.OrderBy.Items, nil)
@@ -720,21 +709,87 @@ func (b *PlanBuilder) buildUnion(union *ast.UnionStmt) (LogicalPlan, error) {
 	return unionPlan, nil
 }
 
+// buildSetOprPlan assembles the union plan from the already divided operand
+// plans. It is shared by buildUnion and by the parenthesised-operand path.
+func (b *PlanBuilder) buildSetOprPlan(distinctSelectPlans, allSelectPlans []LogicalPlan) LogicalPlan {
+	unionDistinctPlan := b.buildUnionAll(distinctSelectPlans)
+	if unionDistinctPlan != nil {
+		unionDistinctPlan = b.buildDistinct(unionDistinctPlan, unionDistinctPlan.Schema().Len())
+		if len(allSelectPlans) > 0 {
+			allSelectPlans = append(allSelectPlans, unionDistinctPlan)
+		}
+	}
+
+	unionAllPlan := b.buildUnionAll(allSelectPlans)
+	unionPlan := unionDistinctPlan
+	if unionAllPlan != nil {
+		unionPlan = unionAllPlan
+	}
+	return unionPlan
+}
+
 // divideUnionSelectPlans resolves union's select stmts to logical plans.
 // and divide result plans into "union-distinct" and "union-all" parts.
 // divide rule ref: https://dev.mysql.com/doc/refman/5.7/en/union.html
 // "Mixed UNION types are treated such that a DISTINCT union overrides any ALL union to its left."
-func (b *PlanBuilder) divideUnionSelectPlans(selects []*ast.SelectStmt) (distinctSelects []LogicalPlan, allSelects []LogicalPlan, err error) {
+// isAfterUnionDistinct reports whether a set-operation operand follows a
+// distinct set operator. The upstream parser replaced the SelectStmt boolean
+// IsAfterUnionDistinct with the AfterSetOperator pointer, and also put it on
+// SetOprSelectList for operands that are themselves parenthesised set
+// operations.
+func isAfterUnionDistinct(node ast.Node) bool {
+	var op *ast.SetOprType
+	switch x := node.(type) {
+	case *ast.SelectStmt:
+		op = x.AfterSetOperator
+	case *ast.SetOprStmt:
+		if x.SelectList != nil {
+			op = x.SelectList.AfterSetOperator
+		}
+	case *ast.SetOprSelectList:
+		// A parenthesised operand carries the operator on the list itself.
+		op = x.AfterSetOperator
+	}
+	return op != nil && *op != ast.UnionAll
+}
+
+// buildSetOprOperand builds the plan for a single operand of a set operation.
+// The upstream parser types operands as ast.Node: a plain SELECT, a nested set
+// operation, or a parenthesised one, which it wraps in a SetOprSelectList.
+func (b *PlanBuilder) buildSetOprOperand(node ast.Node) (LogicalPlan, error) {
+	switch x := node.(type) {
+	case *ast.SelectStmt:
+		return b.buildSelect(x)
+	case *ast.SetOprStmt:
+		return b.buildUnion(x)
+	case *ast.SetOprSelectList:
+		if len(x.Selects) == 1 {
+			return b.buildSetOprOperand(x.Selects[0])
+		}
+		distinctSelectPlans, allSelectPlans, err := b.divideUnionSelectPlans(x.Selects)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		return b.buildSetOprPlan(distinctSelectPlans, allSelectPlans), nil
+	default:
+		return nil, errors.Errorf("unexpected node type %T in set operation", node)
+	}
+}
+
+// The upstream parser types the operands of a set operation as []ast.Node,
+// because an operand may be a parenthesised set operation rather than a plain
+// SELECT.
+func (b *PlanBuilder) divideUnionSelectPlans(selects []ast.Node) (distinctSelects []LogicalPlan, allSelects []LogicalPlan, err error) {
 	firstUnionAllIdx, columnNums := 0, -1
 	// The last slot is reserved for appending distinct union outside this function.
 	children := make([]LogicalPlan, len(selects), len(selects)+1)
 	for i := len(selects) - 1; i >= 0; i-- {
 		stmt := selects[i]
-		if firstUnionAllIdx == 0 && stmt.IsAfterUnionDistinct {
+		if firstUnionAllIdx == 0 && isAfterUnionDistinct(stmt) {
 			firstUnionAllIdx = i + 1
 		}
 
-		selectPlan, err := b.buildSelect(stmt)
+		selectPlan, err := b.buildSetOprOperand(stmt)
 		if err != nil {
 			return nil, nil, errors.Trace(err)
 		}
@@ -815,16 +870,30 @@ func getUintForLimitOffset(sc *stmtctx.StatementContext, val interface{}) (uint6
 	return 0, errors.Errorf("Invalid type %T for LogicalLimit/Offset", val)
 }
 
+// limitValueToUint extracts the literal value of a LIMIT/OFFSET operand.
+// The upstream parser no longer exposes GetValue on ExprNode, so the operand
+// has to be asserted to the driver type first.
+func limitValueToUint(sc *stmtctx.StatementContext, node ast.ExprNode) (uint64, error) {
+	switch v := node.(type) {
+	case *driver.ValueExpr:
+		return getUintForLimitOffset(sc, v.GetValue())
+	case *driver.ParamMarkerExpr:
+		return getUintForLimitOffset(sc, v.GetValue())
+	default:
+		return 0, errors.Errorf("unexpected type %T for LIMIT/OFFSET", node)
+	}
+}
+
 func extractLimitCountOffset(sc *stmtctx.StatementContext, limit *ast.Limit) (count uint64,
 	offset uint64, err error) {
 	if limit.Count != nil {
-		count, err = getUintForLimitOffset(sc, limit.Count.GetValue())
+		count, err = limitValueToUint(sc, limit.Count)
 		if err != nil {
 			return 0, 0, ErrWrongArguments.GenWithStackByArgs("LIMIT")
 		}
 	}
 	if limit.Offset != nil {
-		offset, err = getUintForLimitOffset(sc, limit.Offset.GetValue())
+		offset, err = limitValueToUint(sc, limit.Offset)
 		if err != nil {
 			return 0, 0, ErrWrongArguments.GenWithStackByArgs("LIMIT")
 		}
@@ -937,7 +1006,7 @@ func (a *havingAndOrderbyExprResolver) Enter(n ast.Node) (node ast.Node, skipChi
 	switch n.(type) {
 	case *ast.AggregateFuncExpr:
 		a.inAggFunc = true
-	case *ast.ParamMarkerExpr, *ast.ColumnNameExpr, *ast.ColumnName:
+	case *driver.ParamMarkerExpr, *ast.ColumnNameExpr, *ast.ColumnName:
 	case *ast.SubqueryExpr, *ast.ExistsSubqueryExpr:
 		// Enter a new context, skip it.
 		// For example: select sum(c) + c + exists(select c from t) from t;
@@ -1119,7 +1188,7 @@ func (g *gbyResolver) Enter(inNode ast.Node) (ast.Node, bool) {
 	switch inNode.(type) {
 	case *ast.SubqueryExpr, *ast.CompareSubqueryExpr, *ast.ExistsSubqueryExpr:
 		return inNode, true
-	case *ast.ValueExpr, *ast.ColumnNameExpr, *ast.ParenthesesExpr, *ast.ColumnName:
+	case *driver.ValueExpr, *ast.ColumnNameExpr, *ast.ParenthesesExpr, *ast.ColumnName:
 	default:
 		g.inExpr = true
 	}
@@ -1352,7 +1421,7 @@ func checkExprInGroupBy(p LogicalPlan, expr ast.ExprNode, offset int, loc string
 	}
 	if _, ok := expr.(*ast.ColumnNameExpr); !ok {
 		for _, gbyExpr := range gbyExprs {
-			if reflect.DeepEqual(gbyExpr, expr) {
+			if ast.ExpressionDeepEqual(gbyExpr, expr) {
 				return
 			}
 		}
@@ -1566,7 +1635,7 @@ func (b *PlanBuilder) unfoldWildStar(p LogicalPlan, selectFields []*ast.SelectFi
 					}}
 				colName.SetType(col.GetType())
 				field := &ast.SelectField{Expr: colName}
-				field.SetText(col.ColName.O)
+				field.SetText(nil, col.ColName.O)
 				resultList = append(resultList, field)
 			}
 		}
@@ -1688,8 +1757,8 @@ func (b *PlanBuilder) buildSelect(sel *ast.SelectStmt) (p LogicalPlan, err error
 		}
 	}
 
-	if sel.LockTp != ast.SelectLockNone {
-		p = b.buildSelectLock(p, sel.LockTp)
+	if sel.LockInfo != nil && sel.LockInfo.LockType != ast.SelectLockNone {
+		p = b.buildSelectLock(p, sel.LockInfo.LockType)
 	}
 
 	hasAgg := b.detectSelectAgg(sel)

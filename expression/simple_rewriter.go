@@ -21,6 +21,7 @@ import (
 	"github.com/hanchuanchuan/goInception/parser/opcode"
 	"github.com/hanchuanchuan/goInception/sessionctx"
 	"github.com/hanchuanchuan/goInception/types"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/pingcap/errors"
 )
 
@@ -118,7 +119,7 @@ func (sr *simpleRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok boo
 			return originInNode, false
 		}
 		sr.push(column)
-	case *ast.ValueExpr:
+	case *driver.ValueExpr:
 		value := &Constant{Value: v.Datum, RetType: &v.Type}
 		sr.push(value)
 	case *ast.FuncCallExpr:
@@ -140,7 +141,7 @@ func (sr *simpleRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok boo
 		sr.isNullToExpression(v)
 	case *ast.IsTruthExpr:
 		sr.isTrueToScalarFunc(v)
-	case *ast.PatternLikeExpr:
+	case *ast.PatternLikeOrIlikeExpr:
 		sr.likeToScalarFunc(v)
 	case *ast.PatternRegexpExpr:
 		sr.regexpToScalarFunc(v)
@@ -148,7 +149,7 @@ func (sr *simpleRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok boo
 		if v.Sel == nil {
 			sr.inToExpression(len(v.List), v.Not, &v.Type)
 		}
-	case *ast.ParamMarkerExpr:
+	case *driver.ParamMarkerExpr:
 		tp := types.NewFieldType(mysql.TypeUnspecified)
 		types.DefaultParamTypeForValue(v.GetValue(), tp)
 		value := &Constant{Value: v.Datum, RetType: tp}
@@ -157,6 +158,24 @@ func (sr *simpleRewriter) Leave(originInNode ast.Node) (retNode ast.Node, ok boo
 		sr.rowToScalarFunc(v)
 	case *ast.ParenthesesExpr:
 	case *ast.ColumnName:
+	// The upstream parser wraps the trim direction, the time unit and the
+	// GET_FORMAT selector in their own nodes; transcode them back to the
+	// generic values the builtins expect.
+	case *ast.TrimDirectionExpr:
+		sr.push(&Constant{
+			Value:   types.NewIntDatum(int64(v.Direction)),
+			RetType: types.NewFieldType(mysql.TypeTiny),
+		})
+	case *ast.TimeUnitExpr:
+		sr.push(&Constant{
+			Value:   types.NewStringDatum(v.Unit.String()),
+			RetType: types.NewFieldType(mysql.TypeVarchar),
+		})
+	case *ast.GetFormatSelectorExpr:
+		sr.push(&Constant{
+			Value:   types.NewStringDatum(v.Selector.String()),
+			RetType: types.NewFieldType(mysql.TypeVarchar),
+		})
 	default:
 		sr.err = errors.Errorf("UnknownType: %T", v)
 		return retNode, false
@@ -307,7 +326,7 @@ func (sr *simpleRewriter) unaryOpToExpression(v *ast.UnaryOperationExpr) {
 		op = ast.UnaryMinus
 	case opcode.BitNeg:
 		op = ast.BitNeg
-	case opcode.Not:
+	case opcode.Not, opcode.Not2:
 		op = ast.UnaryNot
 	default:
 		sr.err = errors.Errorf("Unknown Unary Op %T", v.Op)
@@ -323,7 +342,7 @@ func (sr *simpleRewriter) unaryOpToExpression(v *ast.UnaryOperationExpr) {
 	sr.push(newExpr)
 }
 
-func (sr *simpleRewriter) likeToScalarFunc(v *ast.PatternLikeExpr) {
+func (sr *simpleRewriter) likeToScalarFunc(v *ast.PatternLikeOrIlikeExpr) {
 	pattern := sr.pop()
 	expr := sr.pop()
 	sr.err = errors.Trace(CheckArgsNotMultiColumnRow(expr, pattern))
@@ -331,7 +350,7 @@ func (sr *simpleRewriter) likeToScalarFunc(v *ast.PatternLikeExpr) {
 		return
 	}
 	escapeTp := &types.FieldType{}
-	types.DefaultTypeForValue(int(v.Escape), escapeTp)
+	types.DefaultTypeForValue(int(v.Escape), escapeTp, "", "")
 	function := sr.notToExpression(v.Not, ast.Like, &v.Type,
 		expr, pattern, &Constant{Value: types.NewIntDatum(int64(v.Escape)), RetType: escapeTp})
 	sr.push(function)
@@ -421,7 +440,7 @@ func (sr *simpleRewriter) notToExpression(hasNot bool, op string, tp *types.Fiel
 
 func (sr *simpleRewriter) isTrueToScalarFunc(v *ast.IsTruthExpr) {
 	arg := sr.pop()
-	op := ast.IsTruth
+	op := ast.IsTruthWithoutNull
 	if v.True == 0 {
 		op = ast.IsFalsity
 	}

@@ -28,6 +28,7 @@ import (
 	"github.com/hanchuanchuan/goInception/sessionctx"
 	"github.com/hanchuanchuan/goInception/table"
 	"github.com/hanchuanchuan/goInception/types"
+	"github.com/hanchuanchuan/goInception/types/parser_driver"
 	"github.com/hanchuanchuan/goInception/util/ranger"
 	"github.com/pingcap/errors"
 	"modernc.org/mathutil"
@@ -176,7 +177,7 @@ func (b *PlanBuilder) Build(node ast.Node) (Plan, error) {
 		return b.buildPrepare(x), nil
 	case *ast.SelectStmt:
 		return b.buildSelect(x)
-	case *ast.UnionStmt:
+	case *ast.SetOprStmt:
 		return b.buildUnion(x)
 	case *ast.UpdateStmt:
 		return b.buildUpdate(x)
@@ -248,7 +249,7 @@ func (b *PlanBuilder) buildSet(v *ast.SetStmt) (Plan, error) {
 		if _, ok := vars.Value.(*ast.DefaultExpr); !ok {
 			if cn, ok2 := vars.Value.(*ast.ColumnNameExpr); ok2 && cn.Name.Table.L == "" {
 				// Convert column name expression to string value expression.
-				vars.Value = ast.NewValueExpr(cn.Name.Name.O)
+				vars.Value = ast.NewValueExpr(cn.Name.Name.O, "", "")
 			}
 			mockTablePlan := LogicalTableDual{}.init(b.ctx)
 			var err error
@@ -259,10 +260,10 @@ func (b *PlanBuilder) buildSet(v *ast.SetStmt) (Plan, error) {
 		} else {
 			assign.IsDefault = true
 		}
-		if vars.ExtendValue != nil {
+		if v, ok := vars.ExtendValue.(*driver.ValueExpr); ok {
 			assign.ExtendValue = &expression.Constant{
-				Value:   vars.ExtendValue.Datum,
-				RetType: &vars.ExtendValue.Type,
+				Value:   v.Datum,
+				RetType: &v.Type,
 			}
 		}
 		p.VarAssigns = append(p.VarAssigns, assign)
@@ -399,7 +400,13 @@ func (b *PlanBuilder) buildPrepare(x *ast.PrepareStmt) Plan {
 		Name: x.Name,
 	}
 	if x.SQLVar != nil {
-		p.SQLText, _ = x.SQLVar.GetValue().(string)
+		// The upstream parser dropped the value datum that used to hang off
+		// VariableExpr, so read the user variable from the session instead.
+		if v, ok := b.ctx.GetSessionVars().Users[strings.ToLower(x.SQLVar.Name)]; ok {
+			p.SQLText = v
+		} else {
+			p.SQLText = "NULL"
+		}
 	} else {
 		p.SQLText = x.SQLText
 	}
@@ -560,7 +567,7 @@ func (b *PlanBuilder) buildAdminCheckTable(as *ast.AdminStmt) (*CheckTable, erro
 				continue
 			}
 			columnName := &ast.ColumnName{Name: column.Name}
-			columnName.SetText(column.Name.O)
+			columnName.SetText(nil, column.Name.O)
 
 			colExpr, _, err := mockTablePlan.findColumn(columnName)
 			if err != nil {
@@ -682,8 +689,25 @@ func getPhysicalIDs(tblInfo *model.TableInfo, partitionNames []model.CIStr) ([]i
 	return ids, nil
 }
 
-func (b *PlanBuilder) buildAnalyzeTable(as *ast.AnalyzeTableStmt) (Plan, error) {
-	p := &Analyze{MaxNumBuckets: as.MaxNumBuckets}
+// maxNumBucketsFromOpts reads the BUCKETS option of an ANALYZE statement.
+// The upstream parser replaced the dedicated MaxNumBuckets field with a
+// generic AnalyzeOpts list, so it has to be looked up by option type now.
+func maxNumBucketsFromOpts(as *ast.AnalyzeTableStmt) uint64 {
+	for _, opt := range as.AnalyzeOpts {
+		if opt.Type == ast.AnalyzeOptNumBuckets {
+			switch v := opt.Value.GetValue().(type) {
+			case int64:
+				return uint64(v)
+			case uint64:
+				return v
+			}
+		}
+	}
+	return 0
+}
+
+func (b *PlanBuilder) buildAnalyzeTable(as *ast.AnalyzeTableStmt, maxNumBuckets uint64) (Plan, error) {
+	p := &Analyze{MaxNumBuckets: maxNumBuckets}
 	for _, tbl := range as.TableNames {
 		idxInfo, colInfo, pkInfo := getColsInfo(tbl)
 		physicalIDs, err := getPhysicalIDs(tbl.TableInfo, as.PartitionNames)
@@ -704,8 +728,8 @@ func (b *PlanBuilder) buildAnalyzeTable(as *ast.AnalyzeTableStmt) (Plan, error) 
 	return p, nil
 }
 
-func (b *PlanBuilder) buildAnalyzeIndex(as *ast.AnalyzeTableStmt) (Plan, error) {
-	p := &Analyze{MaxNumBuckets: as.MaxNumBuckets}
+func (b *PlanBuilder) buildAnalyzeIndex(as *ast.AnalyzeTableStmt, maxNumBuckets uint64) (Plan, error) {
+	p := &Analyze{MaxNumBuckets: maxNumBuckets}
 	tblInfo := as.TableNames[0].TableInfo
 	physicalIDs, err := getPhysicalIDs(tblInfo, as.PartitionNames)
 	if err != nil {
@@ -723,8 +747,8 @@ func (b *PlanBuilder) buildAnalyzeIndex(as *ast.AnalyzeTableStmt) (Plan, error) 
 	return p, nil
 }
 
-func (b *PlanBuilder) buildAnalyzeAllIndex(as *ast.AnalyzeTableStmt) (Plan, error) {
-	p := &Analyze{MaxNumBuckets: as.MaxNumBuckets}
+func (b *PlanBuilder) buildAnalyzeAllIndex(as *ast.AnalyzeTableStmt, maxNumBuckets uint64) (Plan, error) {
+	p := &Analyze{MaxNumBuckets: maxNumBuckets}
 	tblInfo := as.TableNames[0].TableInfo
 	physicalIDs, err := getPhysicalIDs(tblInfo, as.PartitionNames)
 	if err != nil {
@@ -746,18 +770,19 @@ const (
 )
 
 func (b *PlanBuilder) buildAnalyze(as *ast.AnalyzeTableStmt) (Plan, error) {
-	if as.MaxNumBuckets == 0 {
-		as.MaxNumBuckets = defaultMaxNumBuckets
+	maxNumBuckets := maxNumBucketsFromOpts(as)
+	if maxNumBuckets == 0 {
+		maxNumBuckets = defaultMaxNumBuckets
 	} else {
-		as.MaxNumBuckets = mathutil.MinUint64(as.MaxNumBuckets, numBucketsLimit)
+		maxNumBuckets = mathutil.MinUint64(maxNumBuckets, numBucketsLimit)
 	}
 	if as.IndexFlag {
 		if len(as.IndexNames) == 0 {
-			return b.buildAnalyzeAllIndex(as)
+			return b.buildAnalyzeAllIndex(as, maxNumBuckets)
 		}
-		return b.buildAnalyzeIndex(as)
+		return b.buildAnalyzeIndex(as, maxNumBuckets)
 	}
-	return b.buildAnalyzeTable(as)
+	return b.buildAnalyzeTable(as, maxNumBuckets)
 }
 
 func buildShowDDLFields() *expression.Schema {
@@ -890,7 +915,9 @@ func (b *PlanBuilder) buildShow(show *ast.ShowStmt) (Plan, error) {
 		GlobalScope: show.GlobalScope,
 	}.init(b.ctx)
 	switch showTp := show.Tp; showTp {
-	case ast.ShowProcedureStatus:
+	case ast.ShowProcedureStatus, ast.ShowFunctionStatus:
+		// SHOW FUNCTION STATUS reuses the procedure status logic, as it does
+		// in the parser.
 		p.SetSchema(buildShowProcedureSchema())
 	case ast.ShowTriggers:
 		p.SetSchema(buildShowTriggerSchema())
@@ -1020,7 +1047,7 @@ func (b *PlanBuilder) resolveGeneratedColumns(columns []*table.Column, onDups ma
 			continue
 		}
 		columnName := &ast.ColumnName{Name: column.Name}
-		columnName.SetText(column.Name.O)
+		columnName.SetText(nil, column.Name.O)
 
 		colExpr, _, err := mockPlan.findColumn(columnName)
 		if err != nil {
@@ -1093,7 +1120,7 @@ func (b *PlanBuilder) buildInsert(insert *ast.InsertStmt) (Plan, error) {
 		return n
 	}
 
-	if len(insert.Setlist) > 0 {
+	if insert.Setlist {
 		// Branch for `INSERT ... SET ...`.
 		err := b.buildSetValuesOfInsert(insert, insertPlan, mockTablePlan, checkRefColumn)
 		if err != nil {
@@ -1183,7 +1210,7 @@ func (b *PlanBuilder) getAffectCols(insertStmt *ast.InsertStmt, insertPlan *Inse
 			return nil, errors.Trace(err)
 		}
 
-	} else if len(insertStmt.Setlist) == 0 {
+	} else if !insertStmt.Setlist {
 		// This branch is for the following scenarios:
 		// 1. `INSERT INTO tbl_name {VALUES | VALUE} (value_list) [, (value_list)] ...`,
 		// 2. `INSERT INTO tbl_name SELECT ...`.
@@ -1194,17 +1221,23 @@ func (b *PlanBuilder) getAffectCols(insertStmt *ast.InsertStmt, insertPlan *Inse
 
 func (b *PlanBuilder) buildSetValuesOfInsert(insert *ast.InsertStmt, insertPlan *Insert, mockTablePlan *LogicalTableDual, checkRefColumn func(n ast.Node) ast.Node) error {
 	tableInfo := insertPlan.Table.Meta()
-	colNames := make([]string, 0, len(insert.Setlist))
-	exprCols := make([]*expression.Column, 0, len(insert.Setlist))
-	for _, assign := range insert.Setlist {
-		exprCol, err := insertPlan.tableSchema.FindColumn(assign.Column)
+	// The upstream parser stores `INSERT ... SET a = 1, b = 2` as Columns plus a
+	// single row in Lists, with Setlist flagging the form. It used to be a list
+	// of assignments.
+	if len(insert.Lists) == 0 || len(insert.Lists[0]) != len(insert.Columns) {
+		return errors.Errorf("INSERT ... SET has mismatched columns and values")
+	}
+	colNames := make([]string, 0, len(insert.Columns))
+	exprCols := make([]*expression.Column, 0, len(insert.Columns))
+	for _, col := range insert.Columns {
+		exprCol, err := insertPlan.tableSchema.FindColumn(col)
 		if err != nil {
 			return errors.Trace(err)
 		}
 		if exprCol == nil {
-			return errors.Errorf("Can't find column %s", assign.Column)
+			return errors.Errorf("Can't find column %s", col)
 		}
-		colNames = append(colNames, assign.Column.Name.L)
+		colNames = append(colNames, col.Name.L)
 		exprCols = append(exprCols, exprCol)
 	}
 
@@ -1219,8 +1252,8 @@ func (b *PlanBuilder) buildSetValuesOfInsert(insert *ast.InsertStmt, insertPlan 
 		}
 	}
 
-	for i, assign := range insert.Setlist {
-		expr, _, err := b.rewriteWithPreprocess(assign.Expr, mockTablePlan, nil, true, checkRefColumn)
+	for i, exprNode := range insert.Lists[0] {
+		expr, _, err := b.rewriteWithPreprocess(exprNode, mockTablePlan, nil, true, checkRefColumn)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -1275,7 +1308,7 @@ func (b *PlanBuilder) buildValuesListOfInsert(insert *ast.InsertStmt, insertPlan
 				} else {
 					expr, err = b.getDefaultValue(affectedValuesCols[j])
 				}
-			case *ast.ValueExpr:
+			case *driver.ValueExpr:
 				expr = &expression.Constant{
 					Value:   x.Datum,
 					RetType: &x.Type,
@@ -1348,14 +1381,33 @@ func (b *PlanBuilder) buildSelectPlanOfInsert(insert *ast.InsertStmt, insertPlan
 }
 
 func (b *PlanBuilder) buildLoadData(ld *ast.LoadDataStmt) (Plan, error) {
+	// The upstream parser replaced IsLocal with FileLocRef and made
+	// IgnoreLines a pointer so that "not specified" is distinguishable from 0.
+	var ignoreLines uint64
+	if ld.IgnoreLines != nil {
+		ignoreLines = *ld.IgnoreLines
+	}
+	// The parser leaves FIELDS/LINES nil when the statement omits them, while
+	// the executor expects the MySQL defaults. Fill them in here so the AST
+	// keeps restoring exactly what the user wrote.
+	fieldsInfo := ld.FieldsInfo
+	if fieldsInfo == nil {
+		terminated, escaped := "\t", "\\"
+		fieldsInfo = &ast.FieldsClause{Terminated: &terminated, Escaped: &escaped}
+	}
+	linesInfo := ld.LinesInfo
+	if linesInfo == nil {
+		terminated := "\n"
+		linesInfo = &ast.LinesClause{Terminated: &terminated}
+	}
 	p := &LoadData{
-		IsLocal:     ld.IsLocal,
+		IsLocal:     ld.FileLocRef == ast.FileLocClient,
 		Path:        ld.Path,
 		Table:       ld.Table,
 		Columns:     ld.Columns,
-		FieldsInfo:  ld.FieldsInfo,
-		LinesInfo:   ld.LinesInfo,
-		IgnoreLines: ld.IgnoreLines,
+		FieldsInfo:  fieldsInfo,
+		LinesInfo:   linesInfo,
+		IgnoreLines: ignoreLines,
 	}
 	tableInfo := p.Table.TableInfo
 	tableInPlan, ok := b.is.TableByID(tableInfo.ID)
@@ -1391,7 +1443,7 @@ func (b *PlanBuilder) buildDDL(node ast.DDLNode) Plan {
 	case *ast.CreateDatabaseStmt:
 		b.visitInfo = append(b.visitInfo, visitInfo{
 			privilege: mysql.CreatePriv,
-			db:        v.Name,
+			db:        v.Name.O,
 		})
 	case *ast.CreateIndexStmt:
 		b.visitInfo = append(b.visitInfo, visitInfo{
@@ -1415,7 +1467,7 @@ func (b *PlanBuilder) buildDDL(node ast.DDLNode) Plan {
 	case *ast.DropDatabaseStmt:
 		b.visitInfo = append(b.visitInfo, visitInfo{
 			privilege: mysql.DropPriv,
-			db:        v.Name,
+			db:        v.Name.O,
 		})
 	case *ast.DropIndexStmt:
 		b.visitInfo = append(b.visitInfo, visitInfo{
@@ -1438,16 +1490,18 @@ func (b *PlanBuilder) buildDDL(node ast.DDLNode) Plan {
 			table:     v.Table.Name.L,
 		})
 	case *ast.RenameTableStmt:
-		b.visitInfo = append(b.visitInfo, visitInfo{
-			privilege: mysql.AlterPriv,
-			db:        v.OldTable.Schema.L,
-			table:     v.OldTable.Name.L,
-		})
-		b.visitInfo = append(b.visitInfo, visitInfo{
-			privilege: mysql.AlterPriv,
-			db:        v.NewTable.Schema.L,
-			table:     v.NewTable.Name.L,
-		})
+		for _, table2Table := range v.TableToTables {
+			b.visitInfo = append(b.visitInfo, visitInfo{
+				privilege: mysql.AlterPriv,
+				db:        table2Table.OldTable.Schema.L,
+				table:     table2Table.OldTable.Name.L,
+			})
+			b.visitInfo = append(b.visitInfo, visitInfo{
+				privilege: mysql.AlterPriv,
+				db:        table2Table.NewTable.Schema.L,
+				table:     table2Table.NewTable.Name.L,
+			})
+		}
 	}
 
 	p := &DDL{Statement: node}

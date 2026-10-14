@@ -79,7 +79,7 @@ var MySQLErrName = map[uint16]string{
 	ErrDupKeyName:                               "Duplicate key name '%-.192s'",
 	ErrDupEntry:                                 "Duplicate entry '%-.192s' for key %d",
 	ErrWrongFieldSpec:                           "Incorrect column specifier for column '%-.192s'",
-	ErrParse:                                    "%s near '%-.80s' at line %d",
+	ErrParse:                                    "%s %s",
 	ErrEmptyQuery:                               "Query was empty",
 	ErrNonuniqTable:                             "Not unique table/alias: '%-.192s'",
 	ErrInvalidDefault:                           "Invalid default value for '%-.192s'",
@@ -926,4 +926,5 @@ var MySQLErrName = map[uint16]string{
 	ErrWarnOptimizerHintInvalidToken:    "Cannot use %s '%s' (tok = %d) in an optimizer hint",
 	ErrWarnMemoryQuotaOverflow:          "Max value of MEMORY_QUOTA is %d bytes, ignore this invalid limit",
 	ErrWarnOptimizerHintParseError:      "Optimizer hint syntax error at %v",
+	ErrWarnOptimizerHintWrongPos:        "Optimizer hint can only be followed by certain keywords like SELECT, INSERT, etc.",
 }
