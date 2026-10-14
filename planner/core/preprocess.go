@@ -442,6 +442,10 @@ func (p *preprocessor) checkAlterTableGrammar(stmt *ast.AlterTableStmt) {
 func checkDuplicateColumnName(indexColNames []*ast.IndexPartSpecification) error {
 	colNames := make(map[string]struct{}, len(indexColNames))
 	for _, indexColName := range indexColNames {
+		// 函数索引(如 KEY k((LOWER(name))))只有表达式没有列名
+		if indexColName.Column == nil {
+			continue
+		}
 		name := indexColName.Column.Name
 		if _, ok := colNames[name.L]; ok {
 			return infoschema.ErrColumnExists.GenWithStackByArgs(name)

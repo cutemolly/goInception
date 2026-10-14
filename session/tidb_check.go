@@ -167,6 +167,10 @@ func (s *session) checkAutoIncrementOp(colDef *ast.ColumnDef, num int) (bool, er
 func (s *session) checkDuplicateColumnName(indexColNames []*ast.IndexPartSpecification) {
 	colNames := make(map[string]struct{}, len(indexColNames))
 	for _, indexColName := range indexColNames {
+		// 函数索引(如 KEY k((LOWER(name))))只有表达式没有列名
+		if indexColName.Column == nil {
+			continue
+		}
 		name := indexColName.Column.Name
 		if _, ok := colNames[name.L]; ok {
 			s.appendErrorNo(ER_DUP_FIELDNAME, name)

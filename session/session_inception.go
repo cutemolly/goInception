@@ -2799,6 +2799,10 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 				case ast.ConstraintPrimaryKey:
 					hasPrimary = len(ct.Keys) > 0
 					for _, col := range ct.Keys {
+						if col.Column == nil {
+							// 函数索引项没有列名
+							continue
+						}
 						for _, field := range node.Cols {
 							if field.Name.Name.L == col.Column.Name.L {
 								// 设置主键标志位
@@ -2809,6 +2813,10 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 					}
 				case ast.ConstraintUniq, ast.ConstraintUniqIndex, ast.ConstraintUniqKey:
 					for _, col := range ct.Keys {
+						if col.Column == nil {
+							// 函数索引项没有列名
+							continue
+						}
 						for _, field := range node.Cols {
 							if field.Name.Name.L == col.Column.Name.L {
 								// 设置唯一键标志位
@@ -3056,6 +3064,10 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 					s.checkCreateForeignKey(table, ct)
 					continue
 				}
+				// CHECK 约束不是索引, 走索引校验会被误报缺少 idx_ 前缀
+				if ct.Tp == ast.ConstraintCheck {
+					continue
+				}
 
 				s.checkCreateIndex(nil, ct.Name,
 					ct.Keys, ct.Option, table, false, ct.Tp)
@@ -3064,7 +3076,7 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 				case ast.ConstraintKey, ast.ConstraintUniq,
 					ast.ConstraintIndex, ast.ConstraintUniqKey,
 					ast.ConstraintUniqIndex:
-					if ct.Name == "" {
+					if ct.Name == "" && ct.Keys[0].Column != nil {
 						ct.Name = ct.Keys[0].Column.Name.O
 					}
 					if _, ok := dupIndexes[strings.ToLower(ct.Name)]; ok {
@@ -4867,6 +4879,13 @@ func (s *session) checkIndexAttr(tp ast.ConstraintType, name string,
 func (s *session) checkDupColumnIndex(t *TableInfo, name string, keys []*ast.IndexPartSpecification) {
 	columns := ""
 	for _, c := range keys {
+		// 函数索引没有列名, 用表达式文本占位
+		if c.Column == nil {
+			if c.Expr != nil {
+				columns += c.Expr.Text() + ","
+			}
+			continue
+		}
 		columns += c.Column.Name.String() + ","
 	}
 	idxMap := make(map[string]string)
@@ -5357,6 +5376,10 @@ func (s *session) checkCreateIndex(table *ast.TableName, IndexName string,
 	isBlobColumn := false
 	isOverflowIndexLength := false
 	for _, col := range IndexPartSpecifications {
+		// 函数索引的索引项是表达式而非列名, 无列可校验
+		if col.Column == nil {
+			continue
+		}
 		found := false
 		var foundField FieldInfo
 
@@ -5542,12 +5565,19 @@ func (s *session) checkCreateIndex(table *ast.TableName, IndexName string,
 	}
 	// cache new index
 	for i, col := range IndexPartSpecifications {
+		// 函数索引没有列名, 用表达式文本占位
+		columnName := ""
+		if col.Column != nil {
+			columnName = col.Column.Name.O
+		} else if col.Expr != nil {
+			columnName = col.Expr.Text()
+		}
 		index := &IndexInfo{
 			Table: t.Name,
 			// NonUnique:  unique  ,
 			IndexName:  IndexName,
 			Seq:        i + 1,
-			ColumnName: col.Column.Name.O,
+			ColumnName: columnName,
 			IndexType:  indexType,
 		}
 		if !unique && (tp == ast.ConstraintPrimaryKey || tp == ast.ConstraintUniq ||
@@ -9128,14 +9158,14 @@ var zeroDatum types.Datum
 
 func exprValue(expr ast.ExprNode) interface{} {
 	if v, ok := expr.(*driver.ValueExpr); ok {
-		return exprValue(v)
+		return v.GetDatum().GetValue()
 	}
 	return nil
 }
 
 func exprDatum(expr ast.ExprNode) *types.Datum {
 	if v, ok := expr.(*driver.ValueExpr); ok {
-		return exprDatum(v)
+		return v.GetDatum()
 	}
 	return &zeroDatum
 }
