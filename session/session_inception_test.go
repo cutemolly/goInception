@@ -1474,6 +1474,11 @@ func (s *testSessionIncSuite) TestAlterTableModifyColumn(c *C) {
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_CHANGE_COLUMN_TYPE, "t1.c1", "varchar(100)", "char(10)"))
 
+	// 旧类型长度不足7个字符时不能越界(如 text -> varchar)
+	sql = "create table t1(c1 text);alter table t1 modify column c1 varchar(2048);"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_CHANGE_COLUMN_TYPE, "t1.c1", "text", "varchar(2048)"))
+
 	sql = "create table t1(id int primary key,t1 timestamp default CURRENT_TIMESTAMP,t2 timestamp ON UPDATE CURRENT_TIMESTAMP);"
 	if s.explicitDefaultsForTimestamp || !(strings.Contains(s.sqlMode, "TRADITIONAL") ||
 		(strings.Contains(s.sqlMode, "STRICT_") && strings.Contains(s.sqlMode, "NO_ZERO_DATE"))) {
