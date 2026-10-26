@@ -26,3 +26,5 @@ tools/check/go.sum
 node_modules
 docs/.vuepress/dist
 /goInception
+# 本地编译产物(约44MB)
+/importer
