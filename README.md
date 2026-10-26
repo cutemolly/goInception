@@ -1,108 +1,95 @@
-# goInception
+# goInception (Personal Fork)
 
-<!-- [![travis-ci](https://img.shields.io/travis/hanchuanchuan/goInception.svg)](https://travis-ci.org/hanchuanchuan/goInception) -->
-[![CircleCI Status](https://circleci.com/gh/hanchuanchuan/goInception.svg?style=shield)](https://circleci.com/gh/hanchuanchuan/goInception)
-[![GitHub release](https://img.shields.io/github/release-pre/hanchuanchuan/goInception.svg?style=brightgreen)](https://github.com/hanchuanchuan/goInception/releases)
-[![codecov](https://codecov.io/gh/hanchuanchuan/goInception/branch/master/graph/badge.svg)](https://codecov.io/gh/hanchuanchuan/goInception)
-[![](https://img.shields.io/badge/go-1.22.1-brightgreen.svg)](https://golang.org/dl/)
-[![TiDB](https://img.shields.io/badge/TiDB-v2.1.1-brightgreen.svg)](https://github.com/pingcap/tidb)
-![](https://img.shields.io/github/downloads/hanchuanchuan/goInception/total.svg)
-![](https://img.shields.io/github/license/hanchuanchuan/goInception.svg)
+> **This repository is a personal fork of [hanchuanchuan/goInception](https://github.com/hanchuanchuan/goInception).**
+> The original project was created by [hanchuanchuan](https://github.com/hanchuanchuan) and is maintained by its
+> upstream contributors. All original design and the vast majority of the code belong to them.
+> This fork is maintained for personal learning and internal use — it is **not** an official release.
+> It is distributed under the upstream [Apache License 2.0](LICENSE), and the original copyright notices are retained.
 
+[![Go](https://img.shields.io/badge/go-1.23%2B-brightgreen.svg)](https://golang.org/dl/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Fork of](https://img.shields.io/badge/fork%20of-hanchuanchuan%2FgoInception-blue.svg)](https://github.com/hanchuanchuan/goInception)
 
-**[[English]](README.md)**
-**[[Chinese]](README.zh.md)**
+**[[English]](README.md)** **[[Chinese]](README.zh.md)**
 
+goInception is a MySQL operations tool that reviews, executes, backs up, and generates rollback statements for SQL.
+It parses SQL and returns audit results based on configurable rules.
 
-goInception is a MySQL maintenance tool, which can be used to review, implement, backup, and generate SQL statements for rollback. It parses SQL syntax and returns the result of the review based on custom rules.
+## What this fork changes
 
-**Documentation:**
-**[[Document]](https://hanchuanchuan.github.io/goInception/)**
-**[[中文文档]](https://hanchuanchuan.github.io/goInception/zh/)**
+The main work lives on the `feature/parser-mysql8` branch. Compared with upstream `master`:
 
-**[[Changelog]](https://hanchuanchuan.github.io/goInception/changelog.html)**
+| Area | Change |
+| --- | --- |
+| SQL parser | Upgraded to `github.com/pingcap/tidb/pkg/parser`, adding MySQL 8.0 syntax support |
+| CTE auditing | CTE aliases are no longer falsely reported as "table does not exist" |
+| `ALGORITHM=INSTANT` | Corrected the judgment, including `ALTER INDEX ... VISIBLE/INVISIBLE` |
+| Audit robustness | Fixed nil-pointer and stack-overflow crashes in the audit path; `CHECK` constraints are no longer misidentified as indexes |
+| Query printing | Fixed a stack overflow caused by `--enable-query-print` |
+| SET masking | Fixed a panic and a missed audit caused by parenthesized SET operands |
+| Type changes | Fixed an out-of-range panic when checking a `TEXT` → `VARCHAR(n)` change |
+| Tests | Added an integration test against a real MySQL 8 instance |
 
+## Build
 
-----
-
-### Quick start
-
-
-#### Binary
-
-[goInception Download](https://github.com/hanchuanchuan/goInception/releases)
-
-
-#### Docker Image
-```
-docker pull hanchuanchuan/goinception
-```
-
-
-#### Source code compilation
-
-***go version 1.14+ (go mod)***
+Requirements: **Go 1.23+**
 
 ```bash
-git clone https://github.com/hanchuanchuan/goInception.git
+git clone https://github.com/cutemolly/goInception.git
 cd goInception
-go build -o goInception tidb-server/main.go
+git checkout feature/parser-mysql8
 
+go build -o goInception tidb-server/main.go
+```
+
+## Configure and run
+
+```bash
+cp config/config.toml.default config/config.toml
+# edit backup_host / backup_port / backup_user / backup_password, etc.
 ./goInception -config=config/config.toml
 ```
 
-----
+> `config/config.toml` is listed in `.gitignore` because it holds database connection details.
+> Never commit it and never force-add it with `git add -f`.
 
-#### Associated SQL audit platform
+## Tests
 
-* [Archery](https://github.com/hhyo/Archery) `Query support (MySQL/MsSQL/Redis/PostgreSQL), MySQL optimization (SQLAdvisor|SOAR|SQLTuning), slow log management, table structure comparison, session management, Alibaba Cloud RDS management, etc.`
+```bash
+# Unit tests
+go test ./session
 
+# MySQL 8 integration test (optional, requires a reachable instance)
+export GOINCEPTION_TEST_MYSQL_HOST=127.0.0.1
+export GOINCEPTION_TEST_MYSQL_PORT=3307
+export GOINCEPTION_TEST_MYSQL_USER=root
+export GOINCEPTION_TEST_MYSQL_PASSWORD='your-password'
 
-#### Acknowledgments
-    GoInception reconstructs from the Inception which is a well-known MySQL auditing tool and uses TiDB SQL parser.
+go test ./session -run TestMysql8ModifyTextColumnToVarchar -v
+```
 
-- [Inception](https://github.com/hanchuanchuan/inception)
-- [TiDB](https://github.com/pingcap/tidb)
+The test creates a temporary `test_inc` database and drops its table afterwards.
+If the target instance is unreachable, the test is skipped.
 
-#### Sponsorship and support
-- [Sponsorship and support](https://hanchuanchuan.github.io/goInception/support.html)
+## Upstream and documentation
 
-#### Contact
+- Upstream repository: <https://github.com/hanchuanchuan/goInception>
+- Upstream documentation: <https://hanchuanchuan.github.io/goInception/>
+- Chinese documentation: <https://hanchuanchuan.github.io/goInception/zh/>
+- Upstream changelog: <https://hanchuanchuan.github.io/goInception/changelog.html>
+- Upstream releases / Docker image: <https://github.com/hanchuanchuan/goInception/releases>
 
-QQ group talk: **499262190**
-e-mail: `chuanchuanhan@gmail.com`
+Archery and other upstream integrations keep working through the same protocol.
+For behavior that exists upstream, please consult the upstream docs and issue tracker first;
+for the changes listed above, refer to this repository's commits.
 
-### Contributing
+## License
 
-Welcome and thank you very much for your contribution. For the process of submitting PR, please refer to [CONTRIBUTING.md](CONTRIBUTING.md)。
+[Apache License 2.0](LICENSE). Upstream copyright notices are retained, and the changes in this
+fork are released under the same license.
 
+## Acknowledgments
 
-## Contributors
-
-### Code Contributors
-
-This project exists thanks to all the people who contribute. [[Contribute](CONTRIBUTING.md)].
-<a href="https://github.com/hanchuanchuan/goInception/graphs/contributors"><img src="https://opencollective.com/goInception/contributors.svg?width=890&button=false" /></a>
-
-### Financial Contributors
-
-Become a financial contributor and help us sustain our community. [[Contribute](https://opencollective.com/goInception/contribute)]
-
-#### Individuals
-
-<a href="https://opencollective.com/goInception"><img src="https://opencollective.com/goInception/individuals.svg?width=890"></a>
-
-#### Organizations
-
-Support this project with your organization. Your logo will show up here with a link to your website. [[Contribute](https://opencollective.com/goInception/contribute)]
-
-<a href="https://opencollective.com/goInception/organization/0/website"><img src="https://opencollective.com/goInception/organization/0/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/1/website"><img src="https://opencollective.com/goInception/organization/1/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/2/website"><img src="https://opencollective.com/goInception/organization/2/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/3/website"><img src="https://opencollective.com/goInception/organization/3/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/4/website"><img src="https://opencollective.com/goInception/organization/4/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/5/website"><img src="https://opencollective.com/goInception/organization/5/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/6/website"><img src="https://opencollective.com/goInception/organization/6/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/7/website"><img src="https://opencollective.com/goInception/organization/7/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/8/website"><img src="https://opencollective.com/goInception/organization/8/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/9/website"><img src="https://opencollective.com/goInception/organization/9/avatar.svg"></a>
+- [hanchuanchuan/goInception](https://github.com/hanchuanchuan/goInception) — the upstream project this fork is based on
+- [Inception](https://github.com/hanchuanchuan/inception) — the original MySQL auditing tool that goInception was rebuilt from
+- [TiDB](https://github.com/pingcap/tidb) — SQL parser and execution engine

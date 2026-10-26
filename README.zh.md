@@ -1,110 +1,92 @@
-# goInception
+# goInception（个人改造版）
 
-[![travis-ci](https://img.shields.io/travis/hanchuanchuan/goInception.svg)](https://travis-ci.org/hanchuanchuan/goInception)
-[![CircleCI Status](https://circleci.com/gh/hanchuanchuan/goInception.svg?style=shield)](https://circleci.com/gh/hanchuanchuan/goInception)
-[![GitHub release](https://img.shields.io/github/release-pre/hanchuanchuan/goInception.svg?style=brightgreen)](https://github.com/hanchuanchuan/goInception/releases)
-[![codecov](https://codecov.io/gh/hanchuanchuan/goInception/branch/master/graph/badge.svg)](https://codecov.io/gh/hanchuanchuan/goInception)
-[![](https://img.shields.io/badge/go-1.12-brightgreen.svg)](https://golang.org/dl/)
-[![TiDB](https://img.shields.io/badge/TiDB-v2.1.1-brightgreen.svg)](https://github.com/pingcap/tidb)
-![](https://img.shields.io/github/downloads/hanchuanchuan/goInception/total.svg)
-![](https://img.shields.io/github/license/hanchuanchuan/goInception.svg)
+> **本项目 Fork 自 [hanchuanchuan/goInception](https://github.com/hanchuanchuan/goInception)。**
+> 原始项目由 [hanchuanchuan](https://github.com/hanchuanchuan) 创建，并由上游贡献者共同维护。
+> 本仓库是个人维护的改造版本，主要用于学习与内部实践，**不是官方版本**。
+> 项目遵循上游的 [Apache License 2.0](LICENSE)，原始版权声明予以保留。
 
-<!-- **[English](https://github.com/hanchuanchuan/goInception/blob/master/README.md)**
-**[Chinese](https://github.com/hanchuanchuan/goInception/blob/master/README.zh.md)** -->
+[![Go](https://img.shields.io/badge/go-1.23%2B-brightgreen.svg)](https://golang.org/dl/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Fork of](https://img.shields.io/badge/fork%20of-hanchuanchuan%2FgoInception-blue.svg)](https://github.com/hanchuanchuan/goInception)
 
-**[[English]](README.md)**
-**[[Chinese]](README.zh.md)**
+**[[English]](README.md)** **[[中文]](README.zh.md)**
 
+goInception 是一个集审核、执行、备份及生成回滚语句于一身的 MySQL 运维工具。
+它通过解析 SQL 语法，按照自定义规则返回审核结果，并提供执行、备份和回滚语句生成能力。
 
-goInception是一个集审核、执行、备份及生成回滚语句于一身的MySQL运维工具， 通过对执行SQL的语法解析，返回基于自定义规则的审核结果，并提供执行和备份及生成回滚语句的功能
+## 相对于上游的改造
 
+主要改动位于 `feature/parser-mysql8` 分支。与上游 `master` 相比：
 
-**Documentation:**
-**[[Document]](https://hanchuanchuan.github.io/goInception/)**
-**[[中文文档]](https://hanchuanchuan.github.io/goInception/zh/)**
+| 方向 | 说明 |
+| --- | --- |
+| SQL 解析器 | 升级到 `github.com/pingcap/tidb/pkg/parser`，支持解析 MySQL 8.0 语法 |
+| CTE 审核 | CTE 别名不再被误报为“表不存在” |
+| `ALGORITHM=INSTANT` | 修正判定逻辑，覆盖 `ALTER INDEX ... VISIBLE/INVISIBLE` 等场景 |
+| 审核稳定性 | 修复审核路径中的空指针与栈溢出；`CHECK` 约束不再被误判为索引 |
+| 查询打印 | 修复 `--enable-query-print` 导致的栈溢出 |
+| SET 脱敏 | 修复括号包裹的 SET 操作数导致的 panic 与审核漏检 |
+| 类型变更 | 修复 `TEXT` 改为 `VARCHAR(n)` 时类型判断的越界 panic |
+| 测试 | 新增基于真实 MySQL 8 实例的集成测试 |
 
-**[[更新日志]](https://github.com/hanchuanchuan/inc-docs/blob/master/changelog.md)**
+## 编译
 
-----
-
-### 安装说明
-
-
-#### 二进制免安装
-
-[goInception下载](https://github.com/hanchuanchuan/goInception/releases)
-
-
-#### Docker镜像
-```
-docker pull hanchuanchuan/goinception
-```
-
-
-#### 源码编译
-
-***go version 1.14 (go mod)***
+环境要求：**Go 1.23+**
 
 ```bash
-git clone https://github.com/hanchuanchuan/goInception.git
+git clone https://github.com/cutemolly/goInception.git
 cd goInception
-go build -o goInception tidb-server/main.go
+git checkout feature/parser-mysql8
 
+go build -o goInception tidb-server/main.go
+```
+
+## 配置与运行
+
+```bash
+cp config/config.toml.default config/config.toml
+# 按需修改 backup_host / backup_port / backup_user / backup_password 等配置
 ./goInception -config=config/config.toml
 ```
 
-----
+> `config/config.toml` 已加入 `.gitignore`，其中包含数据库连接信息。
+> 请勿提交该文件，也不要使用 `git add -f` 强制添加。
 
-#### 关联SQL审核平台 `已集成goInception`
+## 测试
 
-* [Archery](https://github.com/hhyo/Archery) `查询支持(MySQL/MsSQL/Redis/PostgreSQL)、MySQL优化(SQLAdvisor|SOAR|SQLTuning)、慢日志管理、表结构对比、会话管理、阿里云RDS管理等`
+```bash
+# 单元测试
+go test ./session
 
+# MySQL 8 集成测试（可选，需要可连接的实例）
+export GOINCEPTION_TEST_MYSQL_HOST=127.0.0.1
+export GOINCEPTION_TEST_MYSQL_PORT=3307
+export GOINCEPTION_TEST_MYSQL_USER=root
+export GOINCEPTION_TEST_MYSQL_PASSWORD='你的密码'
 
-#### 致谢
-    goInception基于TiDB的语法解析器，和业内有名的inpcetion审核工具重构。
-- [Inception - 审核工具](https://github.com/hanchuanchuan/inception)
-- [TiDB](https://github.com/pingcap/tidb)
+go test ./session -run TestMysql8ModifyTextColumnToVarchar -v
+```
 
-#### 赞助&定制
-- [赞助与支持](https://hanchuanchuan.github.io/goInception/support.html)
+该测试会创建临时的 `test_inc` 库并在结束后删除表；目标实例不可达时会自动跳过。
 
-#### 交流
+## 上游与文档
 
-QQ群 **499262190**
+- 上游仓库：<https://github.com/hanchuanchuan/goInception>
+- 上游文档：<https://hanchuanchuan.github.io/goInception/>
+- 中文文档：<https://hanchuanchuan.github.io/goInception/zh/>
+- 上游更新日志：<https://hanchuanchuan.github.io/goInception/changelog.html>
+- 上游发布与 Docker 镜像：<https://github.com/hanchuanchuan/goInception/releases>
 
-*(通用问题建议提issue以便于记录及帮助他人)*
+Archery 等上游生态仍可通过原有协议接入。
+上游已有功能的行为请优先查阅上游文档与 issue；
+本仓库列出的改造内容以本文档和提交记录为准。
 
-### 贡献
+## 许可证
 
-欢迎并非常感谢您的贡献。 有关提交PR的流程请参考 [CONTRIBUTING.md](CONTRIBUTING.zh.md)。
+[Apache License 2.0](LICENSE)。本仓库保留上游版权声明，改造部分同样以该许可证发布。
 
+## 致谢
 
-## Contributors
-
-### Code Contributors
-
-This project exists thanks to all the people who contribute. [[Contribute](CONTRIBUTING.md)].
-<a href="https://github.com/hanchuanchuan/goInception/graphs/contributors"><img src="https://opencollective.com/goInception/contributors.svg?width=890&button=false" /></a>
-
-### Financial Contributors
-
-Become a financial contributor and help us sustain our community. [[Contribute](https://opencollective.com/goInception/contribute)]
-
-#### Individuals
-
-<a href="https://opencollective.com/goInception"><img src="https://opencollective.com/goInception/individuals.svg?width=890"></a>
-
-#### Organizations
-
-Support this project with your organization. Your logo will show up here with a link to your website. [[Contribute](https://opencollective.com/goInception/contribute)]
-
-<a href="https://opencollective.com/goInception/organization/0/website"><img src="https://opencollective.com/goInception/organization/0/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/1/website"><img src="https://opencollective.com/goInception/organization/1/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/2/website"><img src="https://opencollective.com/goInception/organization/2/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/3/website"><img src="https://opencollective.com/goInception/organization/3/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/4/website"><img src="https://opencollective.com/goInception/organization/4/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/5/website"><img src="https://opencollective.com/goInception/organization/5/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/6/website"><img src="https://opencollective.com/goInception/organization/6/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/7/website"><img src="https://opencollective.com/goInception/organization/7/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/8/website"><img src="https://opencollective.com/goInception/organization/8/avatar.svg"></a>
-<a href="https://opencollective.com/goInception/organization/9/website"><img src="https://opencollective.com/goInception/organization/9/avatar.svg"></a>
+- [hanchuanchuan/goInception](https://github.com/hanchuanchuan/goInception) —— 本 Fork 的上游项目
+- [Inception](https://github.com/hanchuanchuan/inception) —— goInception 重构所基于的 MySQL 审核工具
+- [TiDB](https://github.com/pingcap/tidb) —— SQL 解析与执行引擎
